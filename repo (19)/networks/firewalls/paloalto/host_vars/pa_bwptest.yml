@@ -1,0 +1,55 @@
+---
+# Connection details for the primary and secondary members of the HA pair.
+primary_ip_address: 'FW-1 IP Address'
+secondary_ip_address: 'FW-2 IP Address'
+
+# All other playbooks in this repository connect to 'ip_address', so define that as the primary device.
+ip_address: '{{ primary_ip_address }}'
+
+# Encrypted API Key using Ansible Vault
+# To be recreated when in prod
+api_key: !vault |
+          $ANSIBLE_VAULT;1.1;AES256
+          64383836393962343963396561343661656239383766666534656632396538303735663333326631
+          6537656137363030353438383934656161316531313661330a366562666235363435313136336464
+          61323466626566663030353134623562343965396664333864373338343361336438316262316638
+          3636626461353435310a643864653463643934343766643234386139663233393930393163613530
+          31313039616261346266663366626331383235653336386630306566623134316235646235376338
+          38636663346161616139626236366661623366633830306339396331633630626265656134366234
+          66333133396564356263386331333838373136383034626339636233626331623130326561303533
+          65633833623534623063636366313037333230663830386363346335663363656138316230393162
+          35396261363134323264336161616565373363626462353033643639656531333236
+
+# Device hostname
+hostname: 'VAUL-BRGTEST-850-FW1'
+
+# Device service settings
+dns1: '10.51.37.1'
+dns2: '10.51.25.1'
+ntp1: '10.51.44.10'
+ntp2: '10.51.29.10'
+
+# Device interface / IP settings
+interfaces:
+  - { if_name: 'ethernet1/1', mode: 'layer3', ip: ['10.51.40.113/28'],  enable_dhcp: false }
+  - { if_name: 'ethernet1/2', mode: 'layer3', ip: ['10.51.42.14/28'],  enable_dhcp: false }
+  - { if_name: 'ethernet1/3', mode: 'layer3', ip: ['10.51.43.254/24'],  enable_dhcp: false }
+
+# Device security zones
+zones:
+  - { zone: 'Vaultex-Trust', mode: 'layer3', interfaces: ['ethernet1/1'] }
+  - { zone: 'Test-LAN', mode: 'layer3', interfaces: ['ethernet1/2'] }
+  - { zone: 'Test-LAN2', mode: 'layer3', interfaces: ['ethernet1/3']  }
+
+
+# Device routing
+virtual_router:
+  - { name: 'default', interface: ['ethernet1/1','ethernet1/2','ethernet1/3'] }
+
+
+static_routes:
+    - { name: "default",	destination: "0.0.0.0/0", nexthop:  "10.51.40.126" }
+    - { name: "10.51.41.0_24",	destination: "10.51.41.0/24", nexthop:  "10.51.41.1" }
+    - { name: "10.51.43.0_24",	destination: "10.51.43.0/24", nexthop:  "10.51.43.1" }
+    - { name: "10.51.42.128_25",	destination: "10.51.42.128/25", nexthop:  "10.51.42.254" }
+    - { name: "10.51.42.0_24",	destination: "10.51.42.0/24", nexthop:  "10.51.42.1" }

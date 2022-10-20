@@ -1,0 +1,17 @@
+---
+- hosts: windowsvms
+  tasks:
+  - name: Install Powershell 7
+    ansible.windows.win_powershell:
+      script: |
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls, [Net.SecurityProtocolType]::Tls11, [Net.SecurityProtocolType]::Tls12, [Net.SecurityProtocolType]::Ssl3
+        [Net.ServicePointManager]::SecurityProtocol = "Tls, Tls11, Tls12, Ssl3"
+        Invoke-Expression "& { $(Invoke-RestMethod https://aka.ms/install-powershell.ps1) } -UseMSI"
+  - name: Copy Powershell Script to Remote
+    win_copy: 
+      src: './scripts/install_gateway.ps1'
+      dest: 'C:\windows\temp\install_gateway.ps1'
+      remote_src: no
+  - name: convert line endings from Linux to Windows (PowerShell)
+    win_shell: '(Get-Content "C:\windows\temp\install_gateway.ps1") -replace "`n", "`r`n" | Set-Content "C:\windows\temp\install_gateway_w.ps1"'
+

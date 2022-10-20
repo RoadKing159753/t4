@@ -1,0 +1,16 @@
+---
+  - hosts: zzAnsibleTestingEve
+    tasks:
+      - name: Service controller checks
+        block:
+          - name: Check Services are running
+            become_method: runas
+            win_service:
+              name: "{{ item }}"
+              start_mode: auto
+              state: started  
+            loop:
+              - WUAUSERV
+              - THEMES              
+         
+         

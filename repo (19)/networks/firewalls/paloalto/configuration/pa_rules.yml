@@ -1,0 +1,32 @@
+# Ansible Playbook to configure Palo Alto firewall rules
+
+---
+- hosts: '{{ target }}' # Options: test / northampton / wakefield
+  connection: local
+  vars:
+    device:
+      ip_address: '{{ ip_address }}'
+      username: '{{ username | default(omit) }}'
+      password: '{{ password | default(omit) }}'
+      api_key: '{{ api_key | default(omit) }}'
+
+  tasks:
+
+    - include_vars:  # Task to call the variables for the selected device
+        dir: objects/test # Options: objects/test | objects/northampton | objects/wakefield
+
+    - name: Create first security rule
+      paloaltonetworks.panos.panos_security_rule:
+        provider: '{{ device }}'
+        device_group: '{{ device_group | default(omit) }}'
+        rule_name: '{{ item.rule_name }}'
+        source_zone: '{{ item.source_zone }}'
+        source_ip: '{{ item.source_ip }}'
+        destination_zone: '{{ item.destination_zone }}'
+        destination_ip: '{{ item.destination_ip }}'
+        application: '{{ item.application }}'
+        service: '{{ item.service }}'
+        action: '{{ item.action }}'
+        commit: false
+      with_items: '{{ rules }}'
+        

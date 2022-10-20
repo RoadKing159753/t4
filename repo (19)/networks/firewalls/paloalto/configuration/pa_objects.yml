@@ -1,0 +1,73 @@
+# Ansible Playbook to configure Palo Alto firewall objects, services and groups
+
+---
+- hosts: '{{ target }}' # Options: test / northampton / wakefield
+  connection: local
+  vars:
+    device:
+      ip_address: '{{ ip_address }}'
+      username: '{{ username | default(omit) }}'
+      password: '{{ password | default(omit) }}'
+      api_key: '{{ api_key | default(omit) }}'
+
+  tasks:
+
+    - include_vars: # Task to call the variables for the selected device
+        dir: objects/test # Options: test / northampton / wakefield
+
+    - name: Create firewall objects
+      paloaltonetworks.panos.panos_address_object:
+        provider: '{{ device }}'
+        name: '{{ item.name }}'
+        value: '{{ item.value }}'
+        address_type: '{{ item.address_type }}'
+        commit: false
+      loop: '{{ objects }}'
+
+    - name: Create service objects
+      paloaltonetworks.panos.panos_service_object:
+        provider: '{{ device }}'
+        name: '{{ item.name }}'
+        destination_port: '{{ item.destination_port }}'
+        protocol: '{{ item.protocol }}'
+        commit: false
+      loop: '{{ services }}'
+
+#
+# Due to nested groups (Groups within groups), these tasks fail on the first run. Added to a block with a rescue task ro re run.
+#
+    - block:
+      - name: Create address groups
+        paloaltonetworks.panos.panos_address_group:   
+          provider: '{{ device }}'
+          name: '{{ item.name }}'
+          static_value: '{{ item.static_value }}'
+          tag: '{{ item.tag|default([]) }}'
+          commit: false
+        loop: '{{ object_groups }}'
+      rescue:
+      - name: Re running task for nested groups
+        paloaltonetworks.panos.panos_address_group:   
+          provider: '{{ device }}'
+          name: '{{ item.name }}'
+          static_value: '{{ item.static_value }}'
+          commit: false
+        loop: '{{ object_groups }}'
+
+    - block:
+      - name: Create service group objects
+        paloaltonetworks.panos.panos_service_group:
+          provider: '{{ device }}'
+          name: '{{ item.name }}'
+          value: '{{ item.value }}'
+          commit: false
+        loop: '{{ service_groups }}'
+      rescue:
+      - name: Re running task for nested groups
+        paloaltonetworks.panos.panos_service_group:
+          provider: '{{ device }}'
+          name: '{{ item.name }}'
+          value: '{{ item.value }}'
+          commit: false
+        loop: '{{ service_groups }}'
+        

@@ -1,0 +1,8 @@
+---
+- hosts: zzAnsibleTestingEve
+  gather_facts: no
+  tasks:
+    - name: Reboot and wait for updates to apply
+      become: true
+      win_reboot:
+        reboot_timeout: 600

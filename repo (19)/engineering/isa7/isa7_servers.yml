@@ -1,0 +1,1187 @@
+---
+#
+# Ansible Playbook to build the ISA7 Environment.
+#
+# Currently the database server bulid & config playbook is a separate file, but will be merged in once finalised
+# There are various passwords and other values hardcoded in this file that I need to revisit.
+#
+##
+## Common Server Steps
+##
+# Disable Network Level Authentication to allow connection from non-Azure Joined workstations
+- name: ISA7 Post Build Script (Common)
+  hosts: isa7
+  tasks:
+  - name: Disble NLA Set Reg Key 1
+    ansible.windows.win_regedit:
+      path: HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp
+      name: SecurityLayer
+      data: 0
+      type: dword
+
+  - name: Disable NLA Set Reg Key 2
+    ansible.windows.win_regedit:
+      path: HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp
+      name: UserAuthentication
+      data: 0
+      type: dword
+
+
+- name: ISA7 Set suffix on non domain joined machines
+  hosts:
+  - isa7web
+  - isa7session
+  tasks:
+# Set the Domain suffix to be the Vaultex management Azure DNS
+  - name: Set Domain Suffix
+    ansible.windows.win_regedit:
+      path: HKLM:\SYSTEM\CurrentControlSet\services\Tcpip\Parameters
+      name: 'NV Domain'
+      data: 'mgt.prvdns.vaultexuk.net'
+      type: string
+
+
+- name: ISA7 Post Bulid Script (Common)
+  hosts: isa7
+  tasks:
+  - name: Set TimeZone to GMT
+    ansible.windows.win_powershell:
+      script: |
+         if ((get-timezone).id -eq 'GMT Standard Time') {
+             $Ansible.Changed = $false
+         }
+         else {
+             set-timezone 'GMT Standard Time'
+             $Ansible.Changed = $true
+         }
+    register: domain
+# A reboot is required to complete setting of the Domain Suffix
+  - name: Reboot the machine with all defaults
+    ansible.windows.win_reboot:
+    when: domain.changed
+# Disabling of the firewall may be removed following testing.  Firewall rules to allow the relevent traffic should still be included in the playbook
+  - name: Disable firewall for Domain, Public and Private profiles
+    win_firewall:
+      state: disabled
+      profiles:
+      - Domain
+      - Private
+      - Public
+# Create the standard c:\Media folder that we use on on-prem VMs
+  - name: Create Media folder on C
+    ansible.windows.win_file:
+      path: C:\Media
+      state: directory
+# Move the CD drive to Z: if it exists.  It seems to be in some images but not others and needs to be moved so we can use D: for a disk
+  - name: Move CD Rom to Z
+    ansible.windows.win_powershell:
+      script: |
+        $DVD_Drive = Get-WmiObject win32_volume -filter 'DriveType = "5"'
+        if (($DVD_drive.DriveLetter -eq 'Z:') -or ($DVD_drive.count -eq 0)) {
+           $Ansible.Changed = $false
+        }
+        else {
+            $DVD_Drive.DriveLetter = "Z:"
+            $DVD_Drive.Put()
+
+            $Ansible.Changed = $true
+        }
+    register: cdrom
+# I was having issues with the data drive creation until I put this pause in.  It will only pause if something has changed.
+  - name: Pause for a minute for explorer to catch up!
+    pause:
+      minutes: 1
+    when: cdrom.changed
+##
+## WebApp Server specific config
+##
+- name: ISA7 Web Config
+  hosts: isa7web
+  tasks:
+# Initialise and format data drive created by Terraform
+  - name: Configure Data Drive
+    ansible.windows.win_powershell:
+      script: |
+        if (test-path 'd:\') {
+           $Ansible.Changed = $false
+        }
+        else {
+           Initialize-Disk -Number 1
+           New-Partition -DiskNumber 1 -UseMaximumSize -DriveLetter D
+           Format-Volume -DriveLetter D -FileSystem NTFS -NewFileSystemLabel Data -AllocationUnitSize 65536 -Confirm:$false
+           $Ansible.Changed = $true
+        }
+# Copy the ISA7 Media & Unzip
+  - name: Copy ISA7 Zip
+    copy:
+      src: /data/7.4.00.00.zip
+      dest: C:/Media
+
+  - name: Unzip ISA7 Zip
+    ansible.windows.win_powershell:
+      script: |
+        if (test-path 'c:/media/7.4.00.00') {
+           $Ansible.Changed = $false
+        }
+        else {
+           $Ansible.Changed = $true
+           Expand-Archive -path c:/Media/7.4.00.00.zip -destinationpath c:/Media
+        }
+
+# Copy the DotNet 4.8 Offline installer.  We can't use the installer that's distributed with ISA as it's the web version
+# and required internet access to install.
+  - name: Copy .Net 4.8 Offline installer
+    copy:
+      src: /data/ndp48-x86-x64-allos-enu.exe
+      dest: C:/Media
+
+# Install .Net Framework 4.8
+  - name: Check if DotNet 4.8 is installed
+    ansible.windows.win_powershell:
+      script: |
+        if ((get-itemproperty -path 'HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full\1033').version -eq '4.8.03761') {
+           $Ansible.Changed = $false
+        }
+        else {
+           $Ansible.Changed = $true
+        }
+    register: dotnet48
+
+  - name: Install DotNet 4.8 if required
+    ansible.windows.win_package:
+      path: 'C:\Media\ndp48-x86-x64-allos-enu.exe'
+      arguments: /q /norestart
+    when: dotnet48.changed
+
+# Install IIS Prereq features
+  - name: Install IIS Web-Server and management tools
+    ansible.windows.win_feature:
+      name: Web-Server
+      state: present
+      include_sub_features: no
+      include_management_tools: yes
+
+  - name: Install ASP.Net 45
+    ansible.windows.win_feature:
+      name: Web-Asp-Net45
+      state: present
+
+  - name: Install IIS Basic Auth Support
+    ansible.windows.win_feature:
+      name: Web-Basic-Auth
+      state: present
+
+  - name: Install IIS Windows Auth Support
+    ansible.windows.win_feature:
+      name: Web-Windows-Auth
+      state: present
+# Remove directory browsing.  Need to revisit this as it gets added by an earlier step and then removed each time!
+  - name: Remove Directory Browsing Support
+    ansible.windows.win_feature:
+      name: Web-Dir-Browsing
+      state: absent
+
+  - name: Install IIS Management Poswershell Module
+    ansible.windows.win_feature:
+      name: Web-Scripting-Tools
+      state: present
+    register: iis_install
+
+  - name: Reboot the machine with all defaults
+    ansible.windows.win_reboot:
+    when: iis_install.reboot_required
+
+# Copy the Vaultex standard script to relocate IIS to the D: Drive and run
+  - name: Copy Script
+    copy:
+      src: /repos/ansible/engineering/isa7/scripts/moveiisroot.bat
+      dest: C:/windows/temp/moveiisroot.bat
+
+  - name: Move IIS Root to D
+    ansible.windows.win_powershell:
+      script: |
+        if (test-path 'd:/inetpub/') {
+           $Ansible.Changed = $false
+        }
+        else {
+           $Ansible.Changed = $true
+           Start-Process -wait 'cmd.exe'  '/c C:/windows/temp/moveiisroot.bat d >>c:/windows/temp/output.txt'
+        }
+# Remove the default web site
+  - name: Remove Default Web Site
+    ansible.windows.win_powershell:
+      script: |
+        if ((Get-WebSite -Name "Default Web Site").count -eq 0) {
+           $Ansible.Changed = $false
+        }
+        else {
+          $Ansible.Changed = $true
+          Get-WebSite -Name "Default Web Site" | Remove-WebSite -Confirm:$false
+        }
+
+# Create the ISA7 Web Site
+  - name: Copy ISA7 Web Site
+    ansible.windows.win_copy:
+      src: 'C:\Media\7.4.00.00\Release\ISA 7.4.00.00\ISA7\'
+      dest: D:/inetpub/wwwroot/ISA
+      remote_src: yes
+
+  - name: Copy ISA Web.config Template
+    copy:
+      src: /repos/ansible/engineering/isa7/config/Web.config
+      dest: C:/Media
+
+  - name: Copy ISA Web.config Settings Script
+    copy:
+      src: /repos/ansible/engineering/isa7/scripts/get-isasettings.ps1
+      dest: C:/media/get-isasettings.ps1
+
+
+# Build Web.Config with settings relevent to the current environment from the Keyvault and get the SSL Cert to be used later
+  - name: Create ISA Web.config from template
+    ansible.windows.win_powershell:
+      script: |
+        if ((get-content -path 'd:/inetpub/wwwroot/isa/web.config' | select-string ([regex]::Escape('<add name="Maestro" connectionString="" providerName="System.Data.SqlClient" />'))).count -eq 0) {
+           $Ansible.Changed = $false
+        }
+        else {
+           $Ansible.Changed = $true
+           invoke-expression -Command 'C:/media/get-isasettings.ps1'
+        }
+
+  - name: Create ISA App Pool
+    ansible.windows.win_powershell:
+      script: |
+       if ((Get-IISAppPool -name ISA).count -eq 1) {
+           $Ansible.Changed = $false
+       }
+       else {
+           $Ansible.Changed = $true
+           Import-Module WebAdministration
+           New-Item -Path IIS:\AppPools\ISA
+           Set-ItemProperty -Path IIS:\AppPools\ISA -Name managedRuntimeVersion -Value 'v4.0'
+       }
+
+  - name: Create ISA Web Site
+    ansible.windows.win_powershell:
+      script: |
+        if ((Get-IISSite -name ISA).count -eq 1) {
+           $Ansible.Changed = $false
+        }
+        else {
+           $Ansible.Changed = $true
+           Import-Module WebAdministration
+           New-Website -name ISA -Port 80 -ID 1 -PhysicalPath D:\inetpub\wwwroot\ISA -ApplicationPool ISA
+        }
+
+  - name: Import SSL Cert
+    ansible.windows.win_powershell:
+      script: |
+        if ((gci 'Cert:\LocalMachine\WebHosting').count -eq 1) {
+           $Ansible.Changed = $false
+        }
+        else {
+           $Ansible.Changed = $true
+           Import-PFXCertificate -FilePath C:\media\ISACert.pfx -CertStoreLocation 'Cert:\LocalMachine\WebHosting'
+        }
+
+  - name: Add SSL Binding for Web Site
+    ansible.windows.win_powershell:
+      script: |
+        if ((get-webbinding -Protocol HTTPS).count -eq 1) {
+           $Ansible.Changed = $false
+        }
+        else {
+           $Ansible.Changed = $true
+           # Get Certficate Thumbprint
+           $cert = (gci 'Cert:\LocalMachine\WebHosting').thumbprint
+           # Set up the binding
+           New-IISSiteBinding -Name "ISA" -BindingInformation "*:443:" -CertificateThumbPrint $cert -CertStoreLocation "Cert:\LocalMachine\Webhosting" -Protocol https
+        }
+
+  - name: Create ISA External Runner Service
+    ansible.windows.win_service:
+      name: IsaExternalRunner
+      path: D:\inetpub\wwwroot\ISA\bin\DeLaRue.Isa.Core.IsaExternalRunner.exe
+      display_name: ISA External Runner
+      description: ISA External Code Runner
+      start_mode: auto
+      state: stopped
+    register: isaservice
+
+  - name: Add IIS AppPool\ISA Modify access to ISA website
+    ansible.windows.win_acl:
+      path: D:\inetpub\wwwroot\ISA
+      user: 'IIS AppPool\ISA'
+      rights: Modify
+      type: allow
+      state: present
+#
+## ATM Extensions Setup
+#
+# Copy the ISA7 ATM Media & Unzip
+  - name: Copy ISA7 ATM Zip
+    copy:
+      src: '/data/VTX ATM Version.zip'
+      dest: C:/Media
+
+  - name: Unzip ISA7 ATM Zip
+    ansible.windows.win_powershell:
+      script: |
+        if (test-path 'c:/media/VTX ATM Version') {
+           $Ansible.Changed = $false
+        }
+        else {
+           $Ansible.Changed = $true
+           Expand-Archive -path 'c:/Media/VTX ATM Version.zip' -destinationpath c:/Media
+        }
+
+  - name: 02 .ATM Configuration 1.1.1.4
+    ansible.windows.win_copy:
+      src: 'C:\Media\VTX ATM Version\02 .ATM Configuration 1.1.1.4\Extension Files\'
+      dest: D:/inetpub/wwwroot/ISA
+      remote_src: yes
+
+  - name: 03. ATM Management 1.1.1.4
+    ansible.windows.win_copy:
+      src: 'C:\Media\VTX ATM Version\03. ATM Management 1.1.1.4\Extension Files\'
+      dest: D:/inetpub/wwwroot/ISA
+      remote_src: yes
+
+#  - name: 04. ATM Pre-advisement Interface 1.1.0.3
+#    ansible.windows.win_powershell:
+#      script: |
+#        if (test-path 'd:\Program Files\CPS\CPS ATM Pre Advisement Service\Castle.Core.DLL') {
+#           $Ansible.Changed = $false
+#        }
+#        else {
+#           $Ansible.Changed = $true
+#           set-location -path 'C:\Media\VTX ATM Version\04. ATM Pre-advisement Interface 1.1.0.3\Release\Installation'
+#           Start-Process -wait 'cmd.exe' '/c setup.exe targetdir="d:\Program Files\CPS\CPS ATM Pre Advisement Service\"  /quiet'
+#        }
+
+#  - name: 05. ATM Reconciliation Interface 1.0.0.5
+#    ansible.windows.win_powershell:
+#      script: |
+#        if (test-path 'D:\Program Files\CPS\CPS ATM Reconciliation Interface Service\Castle.Core.DLL') {
+#           $Ansible.Changed = $false
+#        }
+#        else {
+#           $Ansible.Changed = $true
+#           set-location -path 'C:\Media\VTX ATM Version\05. ATM Reconciliation Interface 1.0.0.5\Release\Installation'
+#           Start-Process -wait 'cmd.exe' '/c setup.exe targetdir="D:\Program Files\CPS\CPS ATM Reconciliation Interface Service\"  /quiet'
+#        }
+
+  - name: 06.ATM Bag Split Algorithm Utilities 1.0.2.5 - Encryption Tool
+    ansible.windows.win_copy:
+      src: 'C:\Media\VTX ATM Version\06.ATM Bag Split Algorithm Utilities 1.0.2.5\Release\Encryption Tool\DLREncryptDecryptComponent.dll'
+      dest: D:/inetpub/wwwroot/ISA/bin/plugins
+      remote_src: yes
+
+  - name: 06.ATM Bag Split Algorithm Utilities 1.0.2.5 - Plugins
+    ansible.windows.win_copy:
+      src: 'C:\Media\VTX ATM Version\06.ATM Bag Split Algorithm Utilities 1.0.2.5\Release\Plugins\bin\'
+      dest: D:/inetpub/wwwroot/ISA/bin/plugins
+      remote_src: yes
+
+# Set the ATM Extension SQL connection string
+
+  - name: Copy ISA ATM Settings Script
+    copy:
+      src: /repos/ansible/engineering/isa7/scripts/get-isaATMsettings.ps1
+      dest: C:/media/get-isaATMsettings.ps1
+
+# If the config file still contains the default localhost setting then run the config script
+#
+  - name: Update ATM config files with connection string from keyvault
+    ansible.windows.win_powershell:
+      script: |
+        if ((get-content -path 'D:\inetpub\wwwroot\ISA\bin\Plugins\Cps.Isa.AtmBagSplitAlgorithm.Utilities.dll.config' | select-string '10.0.0.152').count -eq 0) {
+           $Ansible.Changed = $false
+        }
+        else {
+           $Ansible.Changed = $true
+           invoke-expression -Command 'C:/media/get-isaATMsettings.ps1'
+        }
+
+  - name: 7. All-Split Even-Fill ATM Bag Split Algorithm 1.0.2.0
+    ansible.windows.win_copy:
+      src: 'C:\Media\VTX ATM Version\7. All-Split Even-Fill ATM Bag Split Algorithm 1.0.2.0\Release\Plugins\bin\'
+      dest: D:/inetpub/wwwroot/ISA/bin/plugins
+      remote_src: yes
+
+  - name: 08. All-Split Max-Fill ATM Bag Split Algorithm 1.0.1.7
+    ansible.windows.win_copy:
+      src: 'C:\Media\VTX ATM Version\08. All-Split Max-Fill ATM Bag Split Algorithm 1.0.1.7\Release\Plugins\bin\'
+      dest: D:/inetpub/wwwroot/ISA/bin/plugins
+      remote_src: yes
+
+  - name: 09. Min-Split Even-Fill ATM Bag Split Algorithm 1.0.1.4
+    ansible.windows.win_copy:
+      src: 'C:\Media\VTX ATM Version\09. Min-Split Even-Fill ATM Bag Split Algorithm 1.0.1.4\Release\Plugins\bin\'
+      dest: D:/inetpub/wwwroot/ISA/bin/plugins
+      remote_src: yes
+
+  - name: 10. Min-Split Max-Fill ATM Bag Split Algorithm 1.0.2.2
+    ansible.windows.win_copy:
+      src: 'C:\Media\VTX ATM Version\10. Min-Split Max-Fill ATM Bag Split Algorithm 1.0.2.2\Release\Plugins\bin\'
+      dest: D:/inetpub/wwwroot/ISA/bin/plugins
+      remote_src: yes
+
+# Copy separately realeased ATM Extension
+#
+  - name: Copy ISA ATM Pack Medium Release
+    copy:
+      src: '/data/ATM Pack Medium Utilities & Algorithm.zip'
+      dest: 'C:/media/ATM Pack Medium Utilities & Algorithm.zip'
+
+  - name: Unzip ATM Medium Release
+    ansible.windows.win_powershell:
+      script: |
+        if (test-path 'C:/media/ATM Pack Medium Utilities & Algorithm') {
+           $Ansible.Changed = $false
+        }
+        else {
+           $Ansible.Changed = $true
+           Expand-Archive -path 'c:/Media/ATM Pack Medium Utilities & Algorithm.zip' -destinationpath c:/Media
+        }
+    register: atmunzip
+
+  - name: Copy ATM Medium Plugin
+    copy:
+      src: 'c:/media/ATM Pack Medium Utilities & Algorithm/Release/All Split Even Fill Pack Med ATM Bag Split 1.0.0.0/Plugins/Cps.Isa.AtmBagSplitAlgorithm.AllSplitEvenFill-Pack-Med.dll'
+      dest: D:/inetpub/wwwroot/ISA/bin/plugins
+      remote_src: yes
+    when: atmunzip.changed
+
+#
+# Install Web Services Extensions
+#
+# Copy the Web Services & Unzip
+  - name: Copy ISA7 Web Services Zip
+    copy:
+      src: '/data/Web Services 1.9.4.0.zip'
+      dest: C:/Media
+
+  - name: Unzip ISA7 Web Services Zip
+    ansible.windows.win_powershell:
+      script: |
+        if (test-path 'c:/media/Web Services 1.9.4.0') {
+           $Ansible.Changed = $false
+        }
+        else {
+           $Ansible.Changed = $true
+           Expand-Archive -path 'c:/Media/Web Services 1.9.4.0.zip' -destinationpath c:/Media
+        }
+
+# Install the Web Service Extension using the installer in quiet mode
+  - name: Check if Web Extensions are installed
+    ansible.windows.win_powershell:
+      script: |
+        if (test-path 'D:\inetpub\wwwroot\ISA\bin\Extensions\DeLaRue.Isa.Extensions.XTATMDefinitionDM.DataModels.dll') {
+           $Ansible.Changed = $false
+        }
+        else {
+           $Ansible.Changed = $true
+        }
+    register: webservice
+
+  - name: Install Web Services Extension if required
+    ansible.windows.win_command: setup.exe targetdir="D:\inetpub\wwwroot\ISA"  /quiet /log c:\media\install_xtwebservice.log
+    args:
+      chdir: C:\Media\Web Services 1.9.4.0\Release\Installer
+    when: webservice.changed
+
+# Copy the ISA7 Order Batch Extension release & Unzip / install
+  - name: Copy ISA7 Order Batch Zip
+    copy:
+      src: '/data/Order_Batch_Extension.zip'
+      dest: C:/Media
+
+  - name: Unzip ISA7 Order Batch Zip
+    ansible.windows.win_powershell:
+      script: |
+        if (test-path 'D:/inetpub/wwwroot/ISA/bin/Extensions/DeLaRue.Isa.Extensions.AtmOrderManagementExtBusinessLogic.dll') {
+           $Ansible.Changed = $false
+        }
+        else {
+           $Ansible.Changed = $true
+           Expand-Archive -path 'c:/Media/Order_Batch_Extension.zip' -destinationpath 'D:/inetpub/wwwroot/ISA'
+        }
+
+  - name: Check if the ISA Menu file has been changed
+    ansible.windows.win_powershell:
+      script: |
+        if ((get-content -path 'D:\inetpub\wwwroot\ISA\IsaMenu.config' | select-string ([regex]::Escape('<!-- <Report Area="Order" ReportName="Orders Bag Enclosure" DisplayName="" /> -->'))).count -eq 0) {
+           $Ansible.Changed = $true
+        }
+        else {
+           $Ansible.Changed = $false
+        }
+    register: menu
+
+  - name: Copy Vaultex Specific Menu File
+    copy:
+      src: /repos/ansible/engineering/isa7/config/IsaMenu.config
+      dest: D:/inetpub/wwwroot/ISA/IsaMenu.config
+    when: menu.changed
+
+  - name: Reboot
+    ansible.windows.win_reboot:
+    when: isaservice.changed
+
+##
+## Session Server specific configuration steps - All Session Servers
+##
+- name: ISA7 Session Config
+  hosts: isa7session
+  tasks:
+# Initialise and format data drive create by Terraform
+  - name: Configure Data Drive
+    ansible.windows.win_powershell:
+      script: |
+        if (test-path 'd:\') {
+           $Ansible.Changed = $false
+        }
+        else {
+           Initialize-Disk -Number 1
+           New-Partition -DiskNumber 1 -UseMaximumSize -DriveLetter D
+           Format-Volume -DriveLetter D -FileSystem NTFS -NewFileSystemLabel Data -AllocationUnitSize 65536 -Confirm:$false
+           $Ansible.Changed = $true
+        }
+# Copy and Extract the ISA7 Media
+  - name: Copy ISA7 Zip
+    copy:
+      src: /data/7.4.00.00.zip
+      dest: C:/Media
+
+  - name: Unzip ISA7 Zip
+    ansible.windows.win_powershell:
+      script: |
+        if (test-path 'c:/media/7.4.00.00') {
+           $Ansible.Changed = $false
+        }
+        else {
+           $Ansible.Changed = $true
+           Expand-Archive -path c:/Media/7.4.00.00.zip -destinationpath c:/Media
+        }
+# Unzip the MongoDB Zip file straight to its installed location
+  - name: Unzip ISA7 MongoDB Zip
+    ansible.windows.win_powershell:
+      script: |
+        if (test-path 'd:\SessionServer\MongoDB') {
+           $Ansible.Changed = $false
+        }
+        else {
+           $Ansible.Changed = $true
+           Expand-Archive -path 'C:\Media\7.4.00.00\Release\ISA 7.4.00.00\Tools\SessionServer\Mongodb.zip' -destinationpath d:\SessionServer
+        }
+# Allow MongoDB specific inbound traffic
+  - name: Firewall rule to allow inbound access to Session Server
+    community.windows.win_firewall_rule:
+      name: Session
+      localport: 27017
+      action: allow
+      direction: in
+      protocol: tcp
+      state: present
+      enabled: yes
+# Install the VC runtime from the ISA7 Media
+  - name: Install the Visual C Runtime
+    ansible.windows.win_package:
+      path: 'D:\SessionServer\MongoDB\bin\vcredist_x64.exe'
+      product_id: '{7F4A9F52-173F-4B0D-B1EA-269C32EDA827}'
+      arguments: /install /passive /norestart
+##
+## Primary Session Server Only Steps
+##
+# Generate the MongoDB Keyfile and copy back to the Ansible server
+- name: ISA7 Session Config (Primary Only)
+  hosts: isa7sessionmaster
+  tasks:
+  - name: Generate MongoDB Keyfile (Primary Only)
+    ansible.windows.win_powershell:
+      script: |
+        if (test-path 'D:\SessionServer\MongoDB\keyfile') {
+           $Ansible.Changed = $false
+        }
+        else {
+           $Ansible.Changed = $true
+           set-location -path D:\SessionServer\MongoDB
+           D:\SessionServer\MongoDB\GenerateKeyFile.ps1
+        }
+    register: keyfile
+
+  - name: Copy Keyfile back to Ansible Server for distribution to other nodes
+    ansible.builtin.fetch:
+      src: D:/SessionServer/MongoDB/keyfile
+      dest: /tmp/keyfile
+      flat: yes
+    when: keyfile.changed
+# Change install location in the config file from C: to D:
+  - name: Change path to D in MongoDB Config File
+    ansible.windows.win_powershell:
+      script: |
+        if (get-content 'D:\SessionServer\MongoDB\etc\mongodb.conf' | select-string 'D:/SessionServer') {
+           $Ansible.Changed = $false
+        }
+        else {
+           $Ansible.Changed = $true
+           ((Get-Content -path 'D:\SessionServer\MongoDB\etc\mongodb.conf') -replace 'C:/SessionServer','D:/SessionServer') | Set-Content -Path 'D:\SessionServer\MongoDB\etc\mongodb.conf'
+        }
+# Create the ISA Session Server Service if it doesn't already exist
+  - name: Check ISASessionServer Status
+    ansible.windows.win_powershell:
+      script: |
+        if (get-service -name 'ISASessionServer') {
+           $Ansible.Changed = $false
+        }
+        else {
+           $Ansible.Changed = $true
+        }
+    register: isaservicecheck
+
+  - name: Create ISA Service
+    win_command: cmd.exe /c D:\SessionServer\MongoDB\IsaSessionServerInstall.bat
+    args:
+      chdir: D:\SessionServer\MongoDB
+    when: isaservicecheck.changed
+# Create ISA Admin Users.  This needs code adding to replace the default password with one taken from the ISA7 keyvault.
+  - name: Create ISA Admin Users
+    ansible.windows.win_powershell:
+      script: |
+        $Ansible.Changed = $true
+        set-location -path D:\SessionServer\MongoDB
+        invoke-command -scriptblock { D:\SessionServer\MongoDB\ConfigurePrimaryAuthentication.bat }
+    when: keyfile.changed
+# Uncomment the MongoDB config file to use the keyfile for authentication between the hosts
+  - name: Remove comment hashes in MongoDB Config File
+    ansible.windows.win_powershell:
+      script: |
+        if (get-content 'D:\SessionServer\MongoDB\etc\mongodb.conf' | select-string '#') {
+           $Ansible.Changed = $true
+           ((Get-Content -path 'D:\SessionServer\MongoDB\etc\mongodb.conf') -replace '#','') | Set-Content -Path 'D:\SessionServer\MongoDB\etc\mongodb.conf'
+        }
+        else {
+           $Ansible.Changed = $false
+        }
+    register: mongo
+
+  - name: restart ISASessionServer
+    ansible.windows.win_service:
+      name: ISASessionServer
+      state: restarted
+    when: mongo.changed
+##
+## Secondary Session Servers Only Steps
+##
+- name: Secondary Nodes Configuration
+  hosts: isa7sessionslaves
+  tasks:
+# Get the keyfile created on the Primary server
+  - name: Copy Keyfile to Secondary Replica Nodes
+    copy:
+      src: /tmp/keyfile
+      dest: D:/SessionServer/MongoDB/keyfile
+# Change install location in the config file from C: to D:
+  - name: Change path to D in MongoDB Config File
+    ansible.windows.win_powershell:
+      script: |
+        if (get-content 'D:\SessionServer\MongoDB\etc\mongodb.conf' | select-string 'D:/SessionServer') {
+           $Ansible.Changed = $false
+        }
+        else {
+           $Ansible.Changed = $true
+           ((Get-Content -path 'D:\SessionServer\MongoDB\etc\mongodb.conf') -replace 'C:/SessionServer','D:/SessionServer') | Set-Content -Path 'D:\SessionServer\MongoDB\etc\mongodb.conf'
+        }
+# Uncomment the MongoDB config file to use the keyfile for authentication between the hosts
+  - name: Remove comment hashes in MongoDB Config File
+    ansible.windows.win_powershell:
+      script: |
+        if (get-content 'D:\SessionServer\MongoDB\etc\mongodb.conf' | select-string '#') {
+           $Ansible.Changed = $true
+           ((Get-Content -path 'D:\SessionServer\MongoDB\etc\mongodb.conf') -replace '#','') | Set-Content -Path 'D:\SessionServer\MongoDB\etc\mongodb.conf'
+        }
+        else {
+           $Ansible.Changed = $false
+        }
+# Create the ISA Session Server Service if it doesn't exist
+  - name: Check ISASessionServer Status
+    ansible.windows.win_powershell:
+      script: |
+        if (get-service -name 'ISASessionServer') {
+           $Ansible.Changed = $false
+        }
+        else {
+           $Ansible.Changed = $true
+        }
+    register: isaservicecheck
+
+  - name: Create ISA Service
+    win_command: cmd.exe /c D:\SessionServer\MongoDB\IsaSessionServerInstall.bat
+    args:
+      chdir: D:\SessionServer\MongoDB
+    when: isaservicecheck.changed
+##
+## Primary Session Server Only Steps
+##
+- name: MongoDB Replica Set (Primary Only)
+  hosts: isa7sessionmaster
+  tasks:
+# Create the ISA replica set.  There is an Ansible module to create a MongoDB replica set but this is is only supported on Linux hosts
+# so we need to go through the process manually
+#
+# First copy the two text files that have the commands to be injected into the MongoDB console
+  - name: Copy Create Replica Script
+    copy:
+      src: /repos/ansible/engineering/isa7/scripts/MongoDBCreateReplicaSet.txt
+      dest: c:/media
+
+  - name: Copy Create Access Users Script
+    copy:
+      src: /repos/ansible/engineering/isa7/scripts/MongoDBCreateAccessUser.txt
+      dest: c:/media
+# Set the primary server name in the config file
+  - name: Create Replica Set - Edit Config File
+    ansible.windows.win_powershell:
+      script: |
+        if (get-content 'D:\SessionServer\MongoDB\ConfigureReplicaSet.js' | select-string 'PRIMARY') {
+           $Ansible.Changed = $true
+           $env=$env:computername.substring(0,3)
+           $primary=$env+"appsisas1"
+           ((Get-Content -path 'D:\SessionServer\MongoDB\ConfigureReplicaSet.js') -replace 'PRIMARY', $primary ) | Set-Content -Path 'D:\SessionServer\MongoDB\ConfigureReplicaSet.js'
+           ((Get-Content -path 'c:\Media\MongoDBCreateReplicaSet.txt') -replace 'env', $env ) | Set-Content -Path 'c:\Media\MongoDBCreateReplicaSet.txt'
+        }
+        else {
+           $Ansible.Changed = $false
+        }
+    register: configrepl
+# Run the MongoDB console and read in the commands from the text files.  Need to replace the plain text password with a value read from the ISA7 Key Vault
+  - name: Create Replica Set
+    ansible.windows.win_powershell:
+      script: |
+           $env=$env:computername.substring(0,3)
+           $Response = Invoke-RestMethod -Uri 'http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fvault.azure.net' -Method GET -Headers @{Metadata="true"}
+           $KeyVaultToken = $Response.access_token
+           $password = (Invoke-RestMethod -Uri https://$env-apps-isa-kv.vault.azure.net/secrets/SiteRootAdmin?api-version=2016-10-01 -Method GET -Headers @{Authorization="Bearer $KeyVaultToken"}).value
+           $primary=$env+"appsisas1"
+           invoke-command -scriptblock { set-location -path d:\sessionserver\mongodb; d:\sessionserver\mongodb\bin\mongo $primary/admin --username siteRootAdmin --password $password c:\media\MongoDBCreateReplicaSet.txt }
+    when: configrepl.changed
+# Create the ISA access user using SiteRootAdmin value from the ISA7 Key vault
+  - name: Create Access User
+    ansible.windows.win_powershell:
+      script: |
+           $env=$env:computername.substring(0,3)
+           $Response = Invoke-RestMethod -Uri 'http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fvault.azure.net' -Method GET -Headers @{Metadata="true"}
+           $KeyVaultToken = $Response.access_token
+           $password = (Invoke-RestMethod -Uri https://$env-apps-isa-kv.vault.azure.net/secrets/SiteRootAdmin?api-version=2016-10-01 -Method GET -Headers @{Authorization="Bearer $KeyVaultToken"}).value
+           $primary=$env+"appsisas1"
+           invoke-command -scriptblock { set-location -path d:\sessionserver\mongodb; D:\sessionserver\mongodb\bin\mongo $primary/admin --username siteRootAdmin --password $password c:\media\MongoDBCreateAccessUser.txt }
+    when: configrepl.changed
+##
+## CIF Server specific configuration steps
+##
+- name: ISA7 CIF Config
+  hosts: isa7cif
+  tasks:
+  # Initialise and format data drive create by Terraform
+  - name: Configure Data Drive
+    ansible.windows.win_powershell:
+      script: |
+        if (test-path 'd:\') {
+           $Ansible.Changed = $false
+        }
+        else {
+           Initialize-Disk -Number 1
+           New-Partition -DiskNumber 1 -UseMaximumSize -DriveLetter D
+           Format-Volume -DriveLetter D -FileSystem NTFS -NewFileSystemLabel Data -AllocationUnitSize 65536 -Confirm:$false
+           $Ansible.Changed = $true
+        }
+  # CIF Manager IIS Prereqs
+  - name: Install IIS Web-Server and management tools
+    ansible.windows.win_feature:
+      name: Web-Server
+      state: present
+      include_sub_features: no
+      include_management_tools: yes
+
+  - name: Install ASP.Net 45
+    ansible.windows.win_feature:
+      name: Web-Asp-Net45
+      state: present
+
+  - name: Install IIS Windows Auth Support
+    ansible.windows.win_feature:
+      name: Web-Windows-Auth
+      state: present
+
+  - name: Install IIS Managament Compatiblilty
+    ansible.windows.win_feature:
+      name: Web-Mgmt-Compat
+      state: present
+
+  - name: Install IIS Management Powershell Module
+    ansible.windows.win_feature:
+      name: Web-Scripting-Tools
+      state: present
+
+  - name: Copy Script
+    copy:
+      src: /repos/ansible/engineering/isa7/scripts/moveiisroot.bat
+      dest: C:/windows/temp/moveiisroot.bat
+
+  - name: Move IIS Root to D
+    ansible.windows.win_powershell:
+      script: |
+        if (test-path 'd:/inetpub/') {
+           $Ansible.Changed = $false
+        }
+        else {
+           $Ansible.Changed = $true
+           Start-Process -wait 'cmd.exe'  '/c C:/windows/temp/moveiisroot.bat d >>c:/windows/temp/output.txt'
+        }
+# Copy and Extract the ISA7 CIF Media
+  - name: Copy CIF Core Media
+    copy:
+      src: '/data/CIF Core 2.1.03.00.zip'
+      dest: C:/Media
+
+  - name: Unzip CIF Core Media
+    ansible.windows.win_powershell:
+      script: |
+        if (test-path 'c:/media/CIF Core 2.1.03.00') {
+           $Ansible.Changed = $false
+        }
+        else {
+           $Ansible.Changed = $true
+           Expand-Archive -path 'c:/Media/CIF Core 2.1.03.00.zip' -destinationpath c:/Media
+        }
+
+  - name: Copy CIF Manager Media
+    copy:
+      src: '/data/CIF Manager 2.0.03.00.zip'
+      dest: C:/Media
+
+  - name: Unzip CIF Manager Media
+    ansible.windows.win_powershell:
+      script: |
+        if (test-path 'c:/media/CIF Manager 2.0.03.00') {
+           $Ansible.Changed = $false
+        }
+        else {
+           $Ansible.Changed = $true
+           Expand-Archive -path 'c:/Media/CIF Manager 2.0.03.00.zip' -destinationpath c:/Media
+        }
+
+# Install the VC runtime from the ISA7 Media
+  - name: Install the Visual C Runtime
+    ansible.windows.win_package:
+      path: 'C:\Media\CIF Core 2.1.03.00\Release\Runtime Environments\vcredist_x64.exe'
+      product_id: '{1D8E6291-B0D5-35EC-8441-6616F567A0F7}'
+      arguments: /install /passive /norestart
+
+##
+## CIF Services
+##
+# Install the CIFS Core Service using the installer in quiet mode
+  - name: Install Core Service
+    ansible.windows.win_powershell:
+      script: |
+        if (test-path 'D:\Program Files\CPS\CIF Core Service\CIF Core Service Manager.exe') {
+           $Ansible.Changed = $false
+        }
+        else {
+           $Ansible.Changed = $true
+           set-location -path 'C:\Media\CIF Core 2.1.03.00\Release\Installation\CIF Core Service'
+           Start-Process -wait 'cmd.exe' '/c setup.exe targetdir="D:\Program Files\CPS\CIF Core Service\"  /quiet'
+        }
+
+
+# Install the CIFS Scheduler Engine using the installer in quiet mode
+  - name: Install Scheduler Engine
+    ansible.windows.win_powershell:
+      script: |
+        if (test-path 'D:\Program Files\CPS\CIF Scheduler Service\CPS.CifSchedulerEngineWinService.exe') {
+           $Ansible.Changed = $false
+        }
+        else {
+           $Ansible.Changed = $true
+           set-location -path 'C:\Media\CIF Core 2.1.03.00\Release\Installation\Scheduler Engine'
+           Start-Process -wait 'cmd.exe' '/c setup.exe targetdir="D:\Program Files\CPS\CIF Scheduler Service\"  /quiet'
+        }
+
+# Install the CIFS Task Status Engine using the installer in quiet mode
+  - name: Install Task Status Engine
+    ansible.windows.win_powershell:
+      script: |
+        if (test-path 'D:\Program Files\CPS\CIF TaskStatus Service\CIF TaskStatus Service Manager.exe') {
+           $Ansible.Changed = $false
+        }
+        else {
+           $Ansible.Changed = $true
+           set-location -path 'C:\Media\CIF Core 2.1.03.00\Release\Installation\Task Status Engine'
+           Start-Process -wait 'cmd.exe' '/c setup.exe targetdir="D:\Program Files\CPS\CIF TaskStatus Service\"  /quiet'
+        }
+
+##
+## CIF Manager
+##
+
+# Remove the default web site
+  - name: Remove Default Web Site
+    ansible.windows.win_powershell:
+      script: |
+        if ((Get-WebSite -Name "Default Web Site").count -eq 0) {
+           $Ansible.Changed = $false
+        }
+        else {
+          $Ansible.Changed = $true
+          Get-WebSite -Name "Default Web Site" | Remove-WebSite -Confirm:$false
+        }
+    register: iisremove
+
+  - name: Reboot the machine with all defaults
+    ansible.windows.win_reboot:
+    when: iisremove.changed
+
+
+  - name: Create ISA CIF App Pool
+    ansible.windows.win_powershell:
+      script: |
+       if ((Get-IISAppPool -name 'CIF-ASP.NETv4.0').count -eq 1) {
+           $Ansible.Changed = $false
+       }
+       else {
+           $Ansible.Changed = $true
+           Import-Module WebAdministration
+           New-Item -Path 'IIS:\AppPools\CIF-ASP.NETv4.0'
+       }
+
+  - name: Create ISA CIF SiteHolder Web Site
+    ansible.windows.win_powershell:
+      script: |
+        if ((Get-IISSite -name SiteHolder).count -eq 1) {
+           $Ansible.Changed = $false
+        }
+        else {
+           $Ansible.Changed = $true
+           Import-Module WebAdministration
+           New-Website -name SiteHolder -Port 80 -ID 1 -PhysicalPath D:\inetpub\wwwroot -ApplicationPool DefaultAppPool
+        }
+
+
+# Install the CIF Manager using the installer in quiet mode
+  - name: Install CIF Manager
+    ansible.windows.win_powershell:
+      script: |
+        if (test-path 'D:\inetpub\wwwroot\CIFManager\bin\CIFManager.dll') {
+           $Ansible.Changed = $false
+        }
+        else {
+           $Ansible.Changed = $true
+           set-location -path 'C:\Media\CIF Manager 2.0.03.00\Release\Installation'
+           Start-Process -wait 'cmd.exe' '/c setup.exe /quiet'
+        }
+    register: cifmanager
+
+  - name: Pause!
+    pause:
+      minutes: 1
+    when: cifmanager.changed
+
+ # Change the App Pool for the CIF Site.  Couldn't get the installer to do it so we're doing it here
+  - name: Change CIFManager Site App Pool
+    ansible.windows.win_powershell:
+      script: |
+        import-module WebAdministration
+        if ((get-item "IIS:\Sites\SiteHolder").ApplicationPool -eq "CIF-ASP.NETv4.0") {
+           $Ansible.Changed = $false
+        }
+        else {
+           $Ansible.Changed = $true
+           Set-ItemProperty 'IIS:\Sites\SiteHolder' applicationPool "CIF-ASP.NETv4.0"
+        }
+
+  - name: Create Events
+    ansible.windows.win_powershell:
+      script: |
+        if ([System.Diagnostics.EventLog]::SourceExists("ECM CIF Manager")) {
+           $Ansible.Changed = $false
+        }
+           else {
+           $Ansible.Changed = $true
+           Invoke-command -scriptblock { set-location -path 'C:\Media\CIF Manager 2.0.03.00\Release\Installation'; invoke-expression -Command '.\CreateEventSource.ps1' }
+        }
+
+# Disable Anonymous Auth and Enable Windows Auth
+#
+  - name: Set CIFManager Authentication Method
+    ansible.windows.win_powershell:
+      script: |
+        if ((Get-WebConfigurationProperty -Filter '/system.webServer/security/authentication/anonymousAuthentication'  -PSPath 'IIS:\' -Location "SiteHolder/CIFManager" -name 'enabled').value -ne 'True') {
+           $Ansible.Changed = $false
+        }
+        else {
+           $Ansible.Changed = $true
+           $iisSiteName = "SiteHolder"
+           $iisAppName = "CIFManager"
+           Set-WebConfigurationProperty -Filter '/system.webServer/security/authentication/anonymousAuthentication' -Name 'enabled' -Value 'false' -PSPath 'IIS:\' -Location "$iisSiteName/$iisAppName"
+           Set-WebConfigurationProperty -Filter '/system.webServer/security/authentication/windowsAuthentication' -Name 'enabled' -Value 'true' -PSPath 'IIS:\' -Location "$iisSiteName/$iisAppName"
+        }
+
+# Set endpoint and domain to local server name - The Domain will change once we domain join the machines as will the users and groups config
+  - name: Set CIF domain and endpoint
+    ansible.windows.win_powershell:
+      script: |
+        $env=$env:computername.substring(0,3)
+        $domain=$env+"ad"
+        $config_file = 'D:\inetpub\wwwroot\CIFManager\Web.config'
+        if (((get-content -path $config_file | select-string 'localhost').count -eq 0)) {
+
+           $Ansible.Changed = $false
+        }
+        else {
+            $env=$env:computername.substring(0,3)
+            $domain=$env+"ad"
+            (Get-Content $config_file) | Foreach-Object {
+              $_ -replace 'localhost', $env:computername `
+              -replace 'SEAN-PC', $domain `
+          } | Set-Content $config_file
+          $Ansible.Changed = $true
+        }
+
+##
+## CIF Client Import Interface
+##
+  - name: Copy CIF Client Import Media
+    copy:
+      src: '/data/Interfaces/CIF Client Import 2.0.1.6.zip'
+      dest: C:/Media
+
+  - name: Unzip CIF Client Import Media
+    ansible.windows.win_powershell:
+      script: |
+        if (test-path 'c:/media/CIF Client Import 2.0.1.6') {
+           $Ansible.Changed = $false
+        }
+        else {
+           $Ansible.Changed = $true
+           Expand-Archive -path 'c:/Media/CIF Client Import 2.0.1.6.zip' -destinationpath c:/Media
+        }
+
+# Install the CIF Client Import Interface using the installer in quiet mode
+  - name: Install Client Import Interface
+    ansible.windows.win_powershell:
+      script: |
+        if (test-path 'D:\Program Files\CPS\CPS Client Import Service') {
+           $Ansible.Changed = $false
+        }
+        else {
+           $Ansible.Changed = $true
+           set-location -path 'c:/Media/CIF Client Import 2.0.1.6/Release/Installation'
+           Start-Process -wait 'cmd.exe' '/c setup.exe targetdir="D:\Program Files\CPS\CPS Client Import Service"  /quiet'
+        }
+
+# Set the CIF connection strings - This script sets the connection strings for CIF Core, Manager and Client Import
+# and also gets the ISA certificate chain from the Keyvault
+  - name: Copy ISA CIF Settings Script
+    copy:
+      src: /repos/ansible/engineering/isa7/scripts/get-isacifsettings.ps1
+      dest: C:/media/get-isacifsettings.ps1
+
+# If the config file still contains the default localhost setting in the connection string then run the config script
+#
+  - name: Update CIF config files with connection string from keyvault
+    ansible.windows.win_powershell:
+      script: |
+        if ((get-content -path 'D:\Program Files\CPS\CIF Core Service\DLR.CifCoreDbAccess.dll.config' | select-string ([regex]::Escape('(local)'))).count -eq 0) {
+           $Ansible.Changed = $false
+        }
+        else {
+           $Ansible.Changed = $true
+           invoke-expression -Command 'C:/media/get-isacifsettings.ps1'
+        }
+# Import the ISA SSL certificate chain and then remove the actual cert as we're only interested in the Root & Sub so that
+# we can trust the ISA SSL cert when we connect to the web services endpoint
+# This may change to a dedicated CIF certificate if we need to enable SSL for CIF Manager
+  - name: Import CA Certs
+    ansible.windows.win_powershell:
+      script: |
+        if ((Get-Childitem cert:\LocalMachine\Root | Where-Object { $_.subject -like '*vtxca-37CA001-CA*' }).count -eq 1) {
+           $Ansible.Changed = $false
+        }
+        else {
+           $Ansible.Changed = $true
+           Import-PFXCertificate -FilePath C:\media\ISACert.pfx -CertStoreLocation 'Cert:\LocalMachine\WebHosting'
+           # Move the Root CA cert to the right store as it gets put in the Intermediate CA Store
+           $cert = (Get-Childitem cert:\LocalMachine\CA | Where-Object { $_.subject -like '*vtxca-37CA001-CA*' }).Thumbprint
+           move-item -path cert:\LocalMachine\CA\$cert -Destination cert:\LocalMachine\Root\
+        }
+
+  - name: Copy User Rights Script
+    copy:
+      src: /repos/ansible/engineering/isa7/scripts/set-userrights.ps1
+      dest: C:/media/set-userrights.ps1
+
+  - name: Assign required permissions to the CIFISA Service Account
+    ansible.windows.win_powershell:
+      script: |
+        $env=$env:computername.substring(0,3)
+        $username=$env+"ad\svc_isacif"
+        Invoke-Command -scriptblock { C:/media/set-userrights.ps1 -AddRight -Username $username -UserRight SeServiceLogonRight}
+        Invoke-Command -scriptblock { C:/media/set-userrights.ps1 -AddRight -Username $username -UserRight SeBatchLogonRight }
+        Add-LocalGroupMember -Group "Administrators" $username
+
+  - name: Change CIF Services Logon Account
+    ansible.windows.win_powershell:
+      script: |
+        $env=$env:computername.substring(0,3)
+        $username=$env+"ad\svc_isacif"
+        $Response = Invoke-RestMethod -Uri 'http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fvault.azure.net' -Method GET -Headers @{Metadata="true"}
+        $KeyVaultToken = $Response.access_token
+        $password = (Invoke-RestMethod -Uri https://$env-apps-isa-kv.vault.azure.net/secrets/svcisacif?api-version=2016-10-01 -Method GET -Headers @{Authorization="Bearer $KeyVaultToken"}).value
+        $service = gwmi win32_service -filter "name='CPS Client Import Service'"
+        $service.change($null,$null,$null,$null,$null,$null,$username,$password)
+
+# We need to create the Instances folder as the Client Import Tool GUI normaly creates this.
+  - name: Create Instances Folder
+    ansible.windows.win_file:
+      path: D:\Program Files\CPS\CPS Client Import Service\Instances
+      state: directory
+
+  - name:  Copy XML File
+    copy:
+      src: '/repos/ansible/engineering/isa7/config/Client Import.xml'
+      dest: 'D:\Program Files\CPS\CPS Client Import Service\Instances\Client Import.xml'
+    register: instance
+
+
+# Set the storage URL in the XML file
+  - name: Set CIF Storage URL
+    ansible.windows.win_powershell:
+      script: |
+        if (get-content 'D:\Program Files\CPS\CPS Client Import Service\Instances\Client Import.xml' | select-string 'storage') {
+           $Ansible.Changed = $true
+           $env=$env:computername.substring(0,3)
+           $storage=$env+"appsisacifst"
+           ((Get-Content -path 'D:\Program Files\CPS\CPS Client Import Service\Instances\Client Import.xml') -replace 'storage', $storage ) | Set-Content -Path 'D:\Program Files\CPS\CPS Client Import Service\Instances\Client Import.xml'
+        }
+        else {
+           $Ansible.Changed = $false
+        }
+
+
+  - name:  Copy instances.XML File
+    copy:
+      src: '/repos/ansible/engineering/isa7/config/InstanceList.xml'
+      dest: 'D:\Program Files\CPS\CPS Client Import Service\InstanceList.xml'
+
+  - name:  Copy and rename Template.XSD (Missing XSD file workaround)
+    copy:
+      src: 'D:\Program Files\CPS\CPS Client Import Service\Template.xsd'
+      dest: 'D:\Program Files\CPS\CPS Client Import Service\Instances\Client Import.xsd'
+      remote_src: yes
+
+  - name: CIF Server Final Reboot
+    ansible.windows.win_reboot:
+    when: instance.changed

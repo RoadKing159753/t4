@@ -1,0 +1,156 @@
+# Ansible Playbook to configure Palo Alto firewall.
+# 
+# This will configure the following:
+#
+# Interfaces / IP Addressing
+# Firewall Zones
+# Virtual Router
+# Static Routes
+# System Settings
+# Objects & Object Groups
+# Services & Service Groups
+#
+# Group tasks are configured to run twice due to nested groups (Groups within groups)
+
+---
+- hosts: '{{ target }}' # Options: test / northampton / wakefield
+  connection: local
+
+  vars:
+    device:
+      ip_address: '{{ ip_address }}'
+      username: '{{ username | default(omit) }}'
+      password: '{{ password | default(omit) }}'
+      api_key: '{{ api_key | default(omit) }}'
+
+  tasks:
+
+    - include_vars: 
+        dir: objects/{{ target }} # Options: test / northampton / wakefield
+
+    - name: Configure interfaces
+      paloaltonetworks.panos.panos_interface:
+        provider: '{{ device }}'
+        template: '{{ template | default(omit) }}'
+        if_name: '{{ item.if_name }}'
+        mode: '{{ item.mode }}'
+        ip: '{{ item.ip }}'
+        enable_dhcp: '{{ item.enable_dhcp }}'
+        commit: false
+      loop: '{{ interfaces }}'
+      tags: network
+
+    - name: Configure firewall zones
+      paloaltonetworks.panos.panos_zone:
+        provider: '{{ device }}'
+        template: '{{ template | default(omit) }}'
+        zone: '{{ item.zone }}'
+        mode: '{{ item.mode }}'
+        interface: '{{ item.interfaces }}'
+      loop: '{{ zones }}'
+      tags: network
+
+    - name: Configure virtual router
+      paloaltonetworks.panos.panos_virtual_router:
+        provider: '{{ device }}'
+        template: '{{ template | default(omit) }}'
+        name: '{{ item.name }}'
+        interface: '{{ item.interface }}'
+        commit: false
+      tags: network
+      loop: '{{ virtual_router }}'
+      
+    - name: Configure static routes
+      paloaltonetworks.panos.panos_static_route:
+        provider: '{{ device }}'
+        template: '{{ template | default(omit) }}'
+        virtual_router: 'default'
+        name: '{{ item.name }}'
+        destination: '{{ item.destination }}'
+        nexthop: '{{ item.nexthop }}'
+      tags: network
+      loop: '{{ static_routes }}'
+
+    - name: Set device local settings
+      paloaltonetworks.panos.panos_mgtconfig:
+        provider: '{{ device }}'
+        hostname: '{{ hostname }}'
+        domain: '{{ domain }}'
+        timezone: '{{ timezone }}'
+        login_banner: '{{ login_banner }}'
+        dns_server_primary: '{{ dns1 }}'
+        dns_server_secondary: '{{ dns2 }}'
+        ntp_server_primary: '{{ ntp1 }}'
+        ntp_server_secondary: '{{ ntp2 }}'
+
+    - name: Create firewall objects
+      paloaltonetworks.panos.panos_address_object:
+        provider: '{{ device }}'
+        name: '{{ item.name }}'
+        value: '{{ item.value }}'
+        address_type: '{{ item.address_type }}'
+        commit: false
+      loop: '{{ objects }}'
+
+    - name: Create service objects
+      paloaltonetworks.panos.panos_service_object:
+        provider: '{{ device }}'
+        name: '{{ item.name }}'
+        destination_port: '{{ item.destination_port }}'
+        protocol: '{{ item.protocol }}'
+        commit: false
+      loop: '{{ services }}'
+
+#
+# Due to nested groups (Groups within groups), these tasks fail on the first run. Added to a block with a rescue task ro re run.
+#
+    - block:
+      - name: Create address groups
+        paloaltonetworks.panos.panos_address_group:   
+          provider: '{{ device }}'
+          name: '{{ item.name }}'
+          static_value: '{{ item.static_value }}'
+          commit: false
+        loop: '{{ object_groups }}'
+      rescue:
+      - name: Re running task for nested groups
+        paloaltonetworks.panos.panos_address_group:   
+          provider: '{{ device }}'
+          name: '{{ item.name }}'
+          static_value: '{{ item.static_value }}'
+          commit: false
+        loop: '{{ object_groups }}'
+
+    - block:
+      - name: Create service group objects
+        paloaltonetworks.panos.panos_service_group:
+          provider: '{{ device }}'
+          name: '{{ item.name }}'
+          value: '{{ item.value }}'
+          commit: false
+        loop: '{{ service_groups }}'
+      rescue:
+      - name: Re running task for nested groups
+        paloaltonetworks.panos.panos_service_group:
+          provider: '{{ device }}'
+          name: '{{ item.name }}'
+          value: '{{ item.value }}'
+          commit: false
+        loop: '{{ service_groups }}'
+        
+    - name: Create security rules
+      paloaltonetworks.panos.panos_security_rule:
+        provider: '{{ device }}'
+        device_group: '{{ device_group | default(omit) }}'
+        rule_name: '{{ item.rule_name }}'
+        source_zone: '{{ item.source_zone }}'
+        source_ip: '{{ item.source_ip }}'
+        source_user: '{{ item.source_user }}'
+        hip_profiles: '{{ item.hip_profiles }}'
+        destination_zone: '{{ item.destination_zone }}'
+        destination_ip: '{{ item.destination_ip }}'
+        application: '{{ item.application }}'
+        service: '{{ item.service }}'
+        action: '{{ item.action }}'
+        commit: false
+      loop: '{{ rules }}'

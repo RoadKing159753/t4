@@ -1,0 +1,17 @@
+---
+- hosts: zzAnsibleTestingEve
+  gather_facts: yes
+  tasks:
+    - name: Install all security, critical, and rollup updates
+      become: True
+      become_method: runas
+      become_user: ansible.user
+      win_updates:
+        category_names:
+         - SecurityUpdates
+         - CriticalUpdates
+         - UpdateRollups
+         - DefinitionUpdates
+         - Updates
+        reboot: yes 
+      register: updates 

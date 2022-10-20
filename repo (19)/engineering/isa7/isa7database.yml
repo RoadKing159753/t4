@@ -1,0 +1,1142 @@
+---
+- name: ISA7 Post Bulid Script
+  hosts: isa7database
+  tasks:
+  - name: Disble NLA Set Reg Key 1
+    ansible.windows.win_regedit:
+      path: HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp
+      name: SecurityLayer
+      data: 0
+      type: dword
+
+  - name: Disable NLA Set Reg Key 2
+    ansible.windows.win_regedit:
+      path: HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp
+      name: UserAuthentication
+      data: 0
+      type: dword
+
+#  - name: Set Domain Suffix
+#    ansible.windows.win_regedit:
+#      path: HKLM:\SYSTEM\CurrentControlSet\services\Tcpip\Parameters
+#      name: 'NV Domain'
+#      data: 'mgt.prvdns.vaultexuk.net'
+#      type: string
+
+  - name: Set TimeZone to GMT
+    ansible.windows.win_powershell:
+      script: |
+         if ((get-timezone).id -eq 'GMT Standard Time') {
+             $Ansible.Changed = $false
+         }
+         else {
+             set-timezone 'GMT Standard Time'
+             $Ansible.Changed = $true
+         }
+
+  - name: Install Failover-Clustering and management tools
+    ansible.windows.win_feature:
+      name: Failover-Clustering
+      state: present
+      include_sub_features: no
+      include_management_tools: yes
+    register: cluster
+
+  - name: Reboot the machine with all defaults
+    ansible.windows.win_reboot:
+    when: cluster.reboot_required
+
+  - name: Allow local account to create cluster
+    ansible.windows.win_regedit:
+      path: HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System
+      name: LocalAccountTokenFilterPolicy
+      data: 1
+      type: dword
+
+  - name: Disable firewall for Domain, Public and Private profiles
+    win_firewall:
+      state: disabled
+      profiles:
+      - Domain
+      - Private
+      - Public
+
+# Allow SQL Inbound
+  - name: Firewall rule to allow inbound access to SQL Server
+    community.windows.win_firewall_rule:
+      name: SQL
+      localport: 1433
+      action: allow
+      direction: in
+      protocol: tcp
+      state: present
+      enabled: yes
+
+  - name: Firewall rule to allow SQL mirroring traffic
+    community.windows.win_firewall_rule:
+      name: SQL_Mirroring
+      localport: 5022
+      action: allow
+      direction: in
+      protocol: tcp
+      state: present
+      enabled: yes
+
+  - name: Create Backup folder on F
+    ansible.windows.win_file:
+      path: c:\media
+      state: directory
+
+- name: Cluster Config (Primary)
+  hosts: isa7databaseprimary
+  become_method: runas
+  tasks:
+  - name: Check Cluster Status
+    ansible.windows.win_powershell:
+      script: |
+         if ((Get-Service -Name clussvc).status -eq 'Running' -and  ((get-cluster).count) -eq 1) {
+             $Ansible.Changed = $false
+         }
+         else {
+             $Ansible.Changed = $true
+         }
+    register: cluster
+
+  - name: Create Cluster
+    win_shell: |
+         $env=$env:computername.substring(0,3)
+         $cluster=$env+"appsisaclu1"
+         $node1=$env+"appsisad1"
+         $node2=$env+"appsisad2"
+         New-Cluster -Name $cluster -Node $node1,$node2 -NoStorage -AdministrativeAccessPoint Dns
+    become: yes
+    become_user: vtxadmin
+    when: cluster.changed
+
+# - name: ISA7 DB Nodes
+#   hosts: isa7database
+#   become_method: runas
+#   tasks:
+#   - name: Create Certs folder on C
+#     ansible.windows.win_file:
+#       path: C:\Certs
+#       state: directory
+
+  - name: Create Backup folder on F
+    ansible.windows.win_file:
+      path: F:\Backup
+      state: directory
+
+  - name: Enable Always On
+    win_shell: |
+         if ((Invoke-Sqlcmd -Query "SELECT SERVERPROPERTY ('IsHadrEnabled');
+            GO" -ServerInstance $env:computername).column1 -eq 0) {
+            Enable-SqlAlwaysOn -ServerInstance $env:computername -Force
+            Restart-Service MSSQLSERVER
+            write-output "changed"
+         }
+    become: yes
+    become_user: vtxadmin
+    register: enablealwayson
+    changed_when: "'changed' in enablealwayson.stdout"
+
+  - name: Start SQL Agent if not started
+    ansible.windows.win_service:
+      name: SQLSERVERAGENT
+      state: started
+
+  - name: Change SQL Server Service Account
+    ansible.windows.win_powershell:
+      script: |
+        $env=$env:computername.substring(0,3)
+        $username=$env+"ad\svc_sql_"+$env+"isaag1"
+        $Response = Invoke-RestMethod -Uri 'http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fvault.azure.net' -Method GET -Headers @{Metadata="true"}
+        $KeyVaultToken = $Response.access_token
+        $password = (Invoke-RestMethod -Uri https://$env-apps-isa-kv.vault.azure.net/secrets/svcsqlisaag1?api-version=2016-10-01 -Method GET -Headers @{Authorization="Bearer $KeyVaultToken"}).value
+        $service = gwmi win32_service -filter "name='MSSQLSERVER'"
+        $service.change($null,$null,$null,$null,$null,$null,$username,$password)
+
+  - name: Change SQL Server Agent Service Account
+    ansible.windows.win_powershell:
+      script: |
+        $env=$env:computername.substring(0,3)
+        $username=$env+"ad\svc_sql_agent_"+$env+"isa"
+        $Response = Invoke-RestMethod -Uri 'http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fvault.azure.net' -Method GET -Headers @{Metadata="true"}
+        $KeyVaultToken = $Response.access_token
+        $password = (Invoke-RestMethod -Uri https://$env-apps-isa-kv.vault.azure.net/secrets/svcsqlagentisaag1?api-version=2016-10-01 -Method GET -Headers @{Authorization="Bearer $KeyVaultToken"}).value
+        $service = gwmi win32_service -filter "name='SQLSERVERAGENT'"
+        $service.change($null,$null,$null,$null,$null,$null,$username,$password)
+
+- name: Create Logins for SQL Services
+  hosts: isa7database
+  become_method: runas
+  tasks:
+  - name: Create logins
+    win_shell: |
+      $env=$env:computername.substring(0,3)
+      $sqlsrv=$env+"ad\svc_sql_"+$env+"isaag1"
+      $sqlagt=$env+"ad\svc_sql_agent_"+$env+"isa"
+      
+      Invoke-Sqlcmd -Query "USE master
+      IF NOT EXISTS (SELECT loginname FROM master.dbo.syslogins WHERE name = '$sqlsrv')
+      CREATE LOGIN [$sqlsrv] FROM WINDOWS WITH DEFAULT_DATABASE=[master], DEFAULT_LANGUAGE=[us_english]
+
+      IF NOT EXISTS (SELECT loginname FROM master.dbo.syslogins WHERE name = '$sqlagt')
+      CREATE LOGIN [$sqlagt] FROM WINDOWS WITH DEFAULT_DATABASE=[master], DEFAULT_LANGUAGE=[us_english]" -ServerInstance $env:computername
+    become: yes
+    become_user: vtxadmin
+
+- name: Create AG (Primary)
+  hosts: isa7databaseprimary
+  become_method: runas
+  tasks:
+  # - name: Check Certificate Status (Primary)
+  #   ansible.windows.win_powershell:
+  #     script: |
+  #         if (test-path C:\certs\AGNode1Cert.crt) {
+  #           $Ansible.Changed = $false
+  #         }
+  #         else {
+  #            $Ansible.Changed = $true
+  #         }
+  #   register: certificate
+
+  # - name: Create Certificates (Primary Node)
+  #   win_shell: |
+  #       $env=$env:computername.substring(0,3)
+  #       $Response = Invoke-RestMethod -Uri 'http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fvault.azure.net' -Method GET -Headers @{Metadata="true"}
+  #       $KeyVaultToken = $Response.access_token
+  #       $masterkey = (Invoke-RestMethod -Uri https://$env-apps-isa-kv.vault.azure.net/secrets/DbMasterKeyPass?api-version=2016-10-01 -Method GET -Headers @{Authorization="Bearer $KeyVaultToken"}).value
+
+  #       Invoke-Sqlcmd -Query "USE master;  
+  #       CREATE MASTER KEY ENCRYPTION BY PASSWORD = `'$masterkey`';
+  #       GO
+  #       --create a cert from the master key
+  #       USE master;  
+  #       CREATE CERTIFICATE AGNode1Cert   
+  #        WITH SUBJECT = 'AGNode1 Certificate';  
+  #       GO  
+  #       --Backup the cert and transfer it to AGNode2
+  #       BACKUP CERTIFICATE AGNode1Cert TO FILE = 'C:\certs\AGNode1Cert.crt';  
+  #       GO" -ServerInstance $env:computername
+  #   become: yes
+  #   become_user: vtxadmin
+  #   when: certificate.changed
+
+  - name: Create Endpoint (Primary Node)
+    win_shell: |
+      $env=$env:computername.substring(0,3)
+      $username=$env+"ad\svc_sql_"+$env+"isaag1"
+      $node2=$env+"appsisad2"
+
+      if ((Invoke-Sqlcmd -Query "select count(e.name) FROM sys.endpoints e
+          INNER JOIN sys.server_principals sp ON e.principal_id = sp.principal_id
+          where e.type = 4
+          GO" -ServerInstance $env:computername).column1 -eq 0) {
+          Invoke-Sqlcmd -Query "USE [master]
+
+          GO
+
+          CREATE ENDPOINT [Hadr_endpoint]
+          AS TCP (LISTENER_PORT = 5022)
+          FOR DATA_MIRRORING (ROLE = ALL, ENCRYPTION = REQUIRED ALGORITHM AES)
+
+          GO
+
+          IF (SELECT state FROM sys.endpoints WHERE name = N'Hadr_endpoint') <> 0
+          BEGIN
+          ALTER ENDPOINT [Hadr_endpoint] STATE = STARTED
+          END
+
+          use [master]
+
+          GO
+
+          GRANT CONNECT ON ENDPOINT::[Hadr_endpoint] TO [$username]
+
+          GO" -ServerInstance $env:computername
+          #Copy-Item -Path 'C:\certs\AGNode1Cert.crt' -Destination "\\$node2\c$\certs"
+          write-output "changed"
+      }
+    become: yes
+    become_user: vtxadmin
+    register: createprimaryendpoint
+    changed_when: "'changed' in createprimaryendpoint.stdout"
+
+- name: Create AG (Secondary)
+  hosts: isa7databasesecondary
+  become_method: runas
+  tasks:
+  # - name: Check Certificate Status (secondary)
+  #   ansible.windows.win_powershell:
+  #     script: |
+  #         if (test-path C:\certs\AGNode2Cert.crt) {
+  #           $Ansible.Changed = $false
+  #         }
+  #         else {
+  #            $Ansible.Changed = $true
+  #         }
+  #   register: certificate2
+
+  # - name: Create Certificates (Secondary Node)
+  #   win_shell: |
+  #       $env=$env:computername.substring(0,3)
+  #       $Response = Invoke-RestMethod -Uri 'http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fvault.azure.net' -Method GET -Headers @{Metadata="true"}
+  #       $KeyVaultToken = $Response.access_token
+  #       $masterkey = (Invoke-RestMethod -Uri https://$env-apps-isa-kv.vault.azure.net/secrets/DbMasterKeyPass?api-version=2016-10-01 -Method GET -Headers @{Authorization="Bearer $KeyVaultToken"}).value
+
+  #       Invoke-Sqlcmd -Query "USE master;  
+  #       CREATE MASTER KEY ENCRYPTION BY PASSWORD = `'$masterkey`';
+  #       GO 
+  #       --create a cert from the master key
+  #       USE master;  
+  #       CREATE CERTIFICATE AGNode2Cert   
+  #         WITH SUBJECT = 'AGNode2 Certificate';  
+  #       GO  
+  #       --Backup the cert and transfer it to AGNode1
+  #       BACKUP CERTIFICATE AGNode2Cert TO FILE = 'C:\certs\AGNode2Cert.crt';  
+  #       GO" -ServerInstance $env:computername
+  #   become: yes
+  #   become_user: vtxadmin
+  #   when: certificate2.changed
+
+  - name: Create Endpoint (Secondary Node)
+    win_shell: |
+      $env=$env:computername.substring(0,3)
+      $node1=$env+"appsisad1"
+      $username=$env+"ad\svc_sql_"+$env+"isaag1"
+
+      if ((Invoke-Sqlcmd -Query "select count(e.name) FROM sys.endpoints e
+          INNER JOIN sys.server_principals sp ON e.principal_id = sp.principal_id
+          where e.type = 4
+          GO" -ServerInstance $env:computername).column1 -eq 0) {
+          Invoke-Sqlcmd -Query "USE [master]
+
+          GO
+
+          CREATE ENDPOINT [Hadr_endpoint]
+          AS TCP (LISTENER_PORT = 5022)
+          FOR DATA_MIRRORING (ROLE = ALL, ENCRYPTION = REQUIRED ALGORITHM AES)
+
+          GO
+
+          IF (SELECT state FROM sys.endpoints WHERE name = N'Hadr_endpoint') <> 0
+          BEGIN
+          ALTER ENDPOINT [Hadr_endpoint] STATE = STARTED
+          END
+
+          use [master]
+
+          GO
+
+          GRANT CONNECT ON ENDPOINT::[Hadr_endpoint] TO [$username]
+
+          GO" -ServerInstance $env:computername
+          #Copy-Item -Path 'C:\certs\AGNode2Cert.crt' -Destination "\\$node1\c$\certs"
+          write-output "changed"
+      }
+    become: yes
+    become_user: vtxadmin
+    register: createsecondaryendpoint
+    changed_when: "'changed' in createsecondaryendpoint.stdout"
+
+# - name: Create Login (Primary)
+#   hosts: isa7databaseprimary
+#   become_method: runas
+#   tasks:
+#   - name: Create Login (Primary Node)
+#     win_shell: |
+#         $env=$env:computername.substring(0,3)
+#         $Response = Invoke-RestMethod -Uri 'http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fvault.azure.net' -Method GET -Headers @{Metadata="true"}
+#         $KeyVaultToken = $Response.access_token
+#         $loginpass = (Invoke-RestMethod -Uri https://$env-apps-isa-kv.vault.azure.net/secrets/AGNodeLoginPass?api-version=2016-10-01 -Method GET -Headers @{Authorization="Bearer $KeyVaultToken"}).value
+        
+#         $env=$env:computername.substring(0,3)
+#         $node2=$env+"appsisad2"
+
+#         Invoke-Sqlcmd -Query "
+#         IF NOT EXISTS 
+#           (SELECT name  
+#           FROM master.sys.server_principals
+#           WHERE name = 'AGNode1_Login')
+#         BEGIN
+#         --create a login for the AGNode1
+#         CREATE LOGIN AGNode1_Login WITH PASSWORD = `'$loginpass`'
+#         --create a database user from the login
+#         CREATE USER AGNode1_User FOR LOGIN AGNode1_Login;  
+#         --create a certificate that the login uses for authentication
+#         CREATE CERTIFICATE AGNode1Cert  
+#           AUTHORIZATION AGNode1_User  
+#           FROM FILE = 'C:\certs\AGNode1Cert.crt'  
+#         --grant connect for login
+#         GRANT CONNECT ON ENDPOINT::hadr_endpoint TO [AGNode1_login];  
+#         END"  -ServerInstance "$node2"
+#     become: yes
+#     become_user: vtxadmin
+
+# - name: Create Login (Secondary)
+#   hosts: isa7databasesecondary
+#   become_method: runas
+#   tasks:
+#   - name: Create Login (Secondary Node)
+#     win_shell: |
+#         $env=$env:computername.substring(0,3)
+#         $Response = Invoke-RestMethod -Uri 'http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fvault.azure.net' -Method GET -Headers @{Metadata="true"}
+#         $KeyVaultToken = $Response.access_token
+#         $loginpass = (Invoke-RestMethod -Uri https://$env-apps-isa-kv.vault.azure.net/secrets/AGNodeLoginPass?api-version=2016-10-01 -Method GET -Headers @{Authorization="Bearer $KeyVaultToken"}).value
+        
+#         $env=$env:computername.substring(0,3)
+#         $node1=$env+"appsisad1"
+
+#         Invoke-Sqlcmd -Query "
+#         IF NOT EXISTS 
+#            (SELECT name  
+#            FROM master.sys.server_principals
+#            WHERE name = 'AGNode2_Login')
+#         BEGIN
+#         --create a login for the AGNode2  
+#         CREATE LOGIN AGNode2_Login WITH PASSWORD = `'$loginpass`'
+#         --create a database user from the login
+#         CREATE USER AGNode2_User FOR LOGIN AGNode2_Login;  
+#         --create a certificate that the login uses for authentication
+#         CREATE CERTIFICATE AGNode2Cert  
+#           AUTHORIZATION AGNode2_User  
+#           FROM FILE = 'C:\certs\AGNode2Cert.crt'  
+#         --grant connect for login
+#         GRANT CONNECT ON ENDPOINT::hadr_endpoint TO [AGNode2_login];  
+#         END" -ServerInstance "$node1"
+#     become: yes
+#     become_user: vtxadmin
+
+- name: Create AG (Primary)
+  hosts: isa7databaseprimary
+  become_method: runas
+  tasks:
+  - name: Create AG DB (Primary Node)
+    win_shell: |
+        Invoke-Sqlcmd -Query "IF NOT EXISTS (SELECT name FROM master.dbo.sysdatabases WHERE name = N'ag01')
+        CREATE DATABASE ag01" -ServerInstance $env:computername
+        Invoke-Sqlcmd -Query "backup database ag01 to disk = 'nul'" -ServerInstance $env:computername
+        Invoke-Sqlcmd -Query "ALTER SERVER ROLE [sysadmin] ADD MEMBER [NT AUTHORITY\SYSTEM]
+        GO" -ServerInstance $env:computername
+    become: yes
+    become_user: vtxadmin
+
+- name: Create AG (Secondary)
+  hosts: isa7databasesecondary
+  become_method: runas
+  tasks:
+  - name: Create AG DB (Secondary Node)
+    win_shell: |
+        Invoke-Sqlcmd -Query "ALTER SERVER ROLE [sysadmin] ADD MEMBER [NT AUTHORITY\SYSTEM]
+        GO" -ServerInstance $env:computername
+    become: yes
+    become_user: vtxadmin
+
+- name: Create AG
+  hosts: isa7database
+  become_method: runas
+  tasks:
+  - name: prepare AG health monitoring
+    win_shell: |
+        Invoke-Sqlcmd -Query "use [master]
+        GO
+        IF (SELECT state FROM sys.endpoints WHERE name = N'hadr_endpoint') <> 0
+        BEGIN
+            ALTER ENDPOINT [hadr_endpoint] STATE = STARTED
+        END
+        GRANT CONNECT ON ENDPOINT::[hadr_endpoint] TO [NT Service\MSSQLSERVER]
+        GO" -ServerInstance $env:computername
+        Invoke-Sqlcmd -Query "IF EXISTS(SELECT * FROM sys.server_event_sessions WHERE name='AlwaysOn_health')
+        BEGIN
+          ALTER EVENT SESSION [AlwaysOn_health] ON SERVER WITH (STARTUP_STATE=ON);
+        END
+        IF NOT EXISTS(SELECT * FROM sys.dm_xe_sessions WHERE name='AlwaysOn_health')
+        BEGIN
+          ALTER EVENT SESSION [AlwaysOn_health] ON SERVER STATE=START;
+        END
+        GO" -ServerInstance $env:computername
+    become: yes
+    become_user: vtxadmin
+
+- name: Create AG (Primary)
+  hosts: isa7databaseprimary
+  become_method: runas
+  tasks:
+  - name: Create AG (Primary)
+    win_shell: |
+        $env=$env:computername.substring(0,3)
+        $node1=$env+"appsisad1"
+        $node2=$env+"appsisad2"
+        $agname=$env+"appsisaag1"
+        
+        Invoke-Sqlcmd -Query "USE [master]
+        GO
+        IF NOT EXISTS 
+          (SELECT Groups.[Name] 
+          FROM sys.dm_hadr_availability_group_states States
+          INNER JOIN master.sys.availability_groups Groups ON States.group_id = Groups.group_id
+          where  Groups.[Name] = `'$agname`')
+        BEGIN
+        CREATE AVAILABILITY GROUP [$agname]
+        WITH (AUTOMATED_BACKUP_PREFERENCE = PRIMARY,
+        DB_FAILOVER = OFF,
+        DTC_SUPPORT = NONE,
+        REQUIRED_SYNCHRONIZED_SECONDARIES_TO_COMMIT = 0)
+        FOR DATABASE [ag01]
+        REPLICA ON N`'$node1`' WITH (ENDPOINT_URL = N'TCP://$node1.mgt.prvdns.vaultexuk.net:5022', FAILOVER_MODE = AUTOMATIC, AVAILABILITY_MODE = SYNCHRONOUS_COMMIT, BACKUP_PRIORITY = 50, SEEDING_MODE = AUTOMATIC, SECONDARY_ROLE(ALLOW_CONNECTIONS = NO)),
+            N`'$node2`' WITH (ENDPOINT_URL = N'TCP://$node2.mgt.prvdns.vaultexuk.net:5022', FAILOVER_MODE = AUTOMATIC, AVAILABILITY_MODE = SYNCHRONOUS_COMMIT, BACKUP_PRIORITY = 50, SEEDING_MODE = AUTOMATIC, SECONDARY_ROLE(ALLOW_CONNECTIONS = NO));
+        END
+        GO" -ServerInstance $env:computername
+    become: yes
+    become_user: vtxadmin
+
+- name: Create AG (Secondary)
+  hosts: isa7databasesecondary
+  become_method: runas
+  tasks:
+  - name: Add Secondary into AG
+    win_shell: |
+        $env=$env:computername.substring(0,3)
+        $node1=$env+"appsisad1"
+        $node2=$env+"appsisad2"
+        $agname=$env+"appsisaag1"
+
+        Invoke-Sqlcmd -Query "USE [master]
+        IF NOT EXISTS 
+          (SELECT Groups.[Name] 
+          FROM sys.dm_hadr_availability_group_states States
+          INNER JOIN master.sys.availability_groups Groups ON States.group_id = Groups.group_id
+          where  Groups.[Name] = `'$agname`')
+        BEGIN
+        ALTER AVAILABILITY GROUP [$agname] JOIN
+        ALTER AVAILABILITY GROUP [$agname] GRANT CREATE ANY DATABASE
+        END
+        GO" -ServerInstance $env:computername
+    become: yes
+    become_user: vtxadmin
+
+- name: Ensure AG is running from Node1
+  hosts: isa7databaseprimary
+  become_method: runas
+  tasks:
+  - name: Failover AG if necessary
+    win_shell: |
+        $env=$env:computername.substring(0,3)
+        $node1=$env+"appsisad1"
+        $node2=$env+"appsisad2"
+        $agname=$env+"appsisaag1"
+
+        Invoke-Sqlcmd -Query "IF EXISTS (
+        select n.group_name,n.replica_server_name,rs.role_desc
+        from sys.dm_hadr_availability_replica_cluster_nodes n
+        join sys.dm_hadr_availability_replica_cluster_states cs
+        on n.replica_server_name = cs.replica_server_name
+        join sys.dm_hadr_availability_replica_states rs  
+        on rs.replica_id = cs.replica_id
+        where n.replica_server_name = `'$node1`' and role_desc = 'SECONDARY'
+        )
+        BEGIN
+        alter availability group $agname failover 
+        END
+        GO" -ServerInstance $env:computername
+    become: yes
+    become_user: vtxadmin
+
+- name: Create DNN listener
+  hosts: isa7databaseprimary
+  become_method: runas
+  tasks:
+  - name: Create DNN Listener
+    win_shell: |
+        if (((Get-ClusterResource).name | select-string '3433').count -eq 0) {
+          $port = "3433"
+          $env=$env:computername.substring(0,3)
+          $ag = $env+"appsisaag1"
+          $dns = $env+"appsisaag1"
+          $ErrorActionPreference = "Stop"
+          Add-ClusterResource -Name $Port -ResourceType "Distributed Network Name" -Group $Ag 
+          Get-ClusterResource -Name $Port | Set-ClusterParameter -Name DnsName -Value $Dns 
+          Start-ClusterResource -Name $Port
+          $Dep = Get-ClusterResourceDependency -Resource $Ag
+          if ( $Dep.DependencyExpression -match '\s*\((.*)\)\s*' )
+          {
+            $DepStr = "$($Matches.1) or [$Port]"
+          }
+          else
+          {
+            $DepStr = "[$Port]"
+          }
+          Set-ClusterResourceDependency -Resource $Ag -Dependency "$DepStr"
+          Stop-ClusterResource -Name $Ag
+          Start-ClusterResource -Name $Ag
+          write-output "changed"
+        }
+    register: dnn
+    become: yes
+    become_user: vtxadmin
+    changed_when: "'changed' in dnn.stdout"
+
+  - name: Reboot the machine with all defaults
+    ansible.windows.win_reboot:
+    when: dnn.changed
+
+- name: Set SQL best practices
+  hosts: isa7database
+  become_method: runas
+  tasks:
+  - name: Set Folder Permissions
+    win_shell: |
+        $sharepath = "F:\data"
+        $Acl = Get-ACL $SharePath
+        $AccessRule= New-Object System.Security.AccessControl.FileSystemAccessRule("NT Service\MSSQLSERVER","FullControl","ContainerInherit,Objectinherit","none","Allow")
+        $Acl.AddAccessRule($AccessRule)
+        Set-Acl $SharePath $Acl
+        $sharepath = "G:\log"
+        $Acl = Get-ACL $SharePath
+        $AccessRule= New-Object System.Security.AccessControl.FileSystemAccessRule("NT Service\MSSQLSERVER","FullControl","ContainerInherit,Objectinherit","none","Allow")
+        $Acl.AddAccessRule($AccessRule)
+        Set-Acl $SharePath $Acl
+    become: yes
+    become_user: vtxadmin
+  - name: Configure server settings
+    win_shell: |
+        Invoke-Sqlcmd -Query "--Enable default backup compression
+        EXEC sys.sp_configure N'backup compression default', N'1'
+        GO
+        RECONFIGURE WITH OVERRIDE
+        GO" -ServerInstance $env:computername
+        Invoke-Sqlcmd -Query "-- SET DEFAULT BACKUP DIRECTORY
+        USE [master]
+        GO
+        EXEC xp_instance_regwrite N'HKEY_LOCAL_MACHINE', N'Software\Microsoft\MSSQLServer\MSSQLServer', N'BackupDirectory', REG_SZ, N'F:\Backup'
+        GO" -ServerInstance $env:computername
+        Invoke-Sqlcmd -Query "-- Optimise Ad Hoc workloads
+        USE master
+        GO
+        EXEC sp_configure 'show advanced options', 1
+        reconfigure
+        go
+        EXEC sp_configure 'optimize for ad hoc workloads', 1
+        GO
+        RECONFIGURE
+        GO" -ServerInstance $env:computername
+        Invoke-Sqlcmd -Query "-- Set Min and Max memory
+        EXEC sys.sp_configure N'min server memory (MB)', N'2000'
+        GO
+        EXEC sys.sp_configure N'max server memory (MB)', N'12000'
+        GO
+        RECONFIGURE WITH OVERRIDE
+        GO" -ServerInstance $env:computername
+        Invoke-Sqlcmd -Query "IF NOT EXISTS (SELECT 1 FROM sys.master_files WHERE database_id = DB_ID(N'tempdb') and name = 'temp3')
+        BEGIN
+        USE [master]
+        ALTER DATABASE [tempdb] MODIFY FILE ( NAME = N'temp2', SIZE = 1048576KB , FILEGROWTH = 1048576KB )
+        ALTER DATABASE [tempdb] MODIFY FILE ( NAME = N'tempdev', SIZE = 1048576KB , FILEGROWTH = 1048576KB )
+        ALTER DATABASE [tempdb] MODIFY FILE ( NAME = N'templog', SIZE = 1048576KB , FILEGROWTH = 1048576KB )
+        ALTER DATABASE [tempdb] ADD FILE ( NAME = N'temp3', FILENAME = N'D:\temp\Data\temp3.ndf' , SIZE = 1048576KB , FILEGROWTH = 1048576KB )
+        ALTER DATABASE [tempdb] ADD FILE ( NAME = N'temp4', FILENAME = N'D:\temp\Data\temp4.ndf' , SIZE = 1048576KB , FILEGROWTH = 1048576KB )
+        END
+        GO" -ServerInstance $env:computername
+        Invoke-Sqlcmd -Query "-- cost threshold for parralelism
+        USE master
+        GO
+        EXEC sp_configure 'show advanced options', 1
+        reconfigure
+        go
+        EXEC sp_configure 'cost threshold for parallelism', 25
+        GO
+        RECONFIGURE
+        GO" -ServerInstance $env:computername
+    become: yes
+    become_user: vtxadmin
+  - name: Copy Script
+    copy:
+      src: /repos/ansible/engineering/isa7/scripts/set-userrights.ps1
+      dest: C:/media/set-userrights.ps1
+  - name: Configure AG
+    win_shell: |
+        Invoke-Command -scriptblock { C:/media/set-userrights.ps1 -AddRight -Username 'NT Service\MSSQLSERVER' -UserRight SeLockMemoryPrivilege}
+        Invoke-Command -scriptblock { C:/media/set-userrights.ps1 -AddRight -Username 'NT Service\MSSQLSERVER' -UserRight SeManageVolumePrivilege }
+    become: yes
+    become_user: vtxadmin
+  - name: Move MSDB
+    win_shell: |
+        if ((Invoke-Sqlcmd -Query "-- check location of msdb database
+        use msdb
+        go
+        select count(physical_name)  from sys.database_files
+        where physical_name like 'c:\%'
+        " -ServerInstance $env:computername).column1 -ge 1)
+        {
+          $msdbDataOld = 'C:\Program Files\Microsoft SQL Server\MSSQL15.MSSQLSERVER\MSSQL\DATA\MSDBData.mdf'
+          $msdbDataNew = 'F:\data\MSDBData.mdf'
+
+          $msdbLogOld = 'C:\Program Files\Microsoft SQL Server\MSSQL15.MSSQLSERVER\MSSQL\DATA\MSDBLog.ldf'
+          $msdbLogNew = 'G:\log\MSDBLog.ldf'
+
+          Invoke-Sqlcmd -Query "alter database msdb
+          modify file (name = 'MSDBData', filename = '$msdbDataNew')" -ServerInstance $env:computername
+
+          Invoke-Sqlcmd -Query "alter database msdb
+          modify file (name = 'MSDBLog', filename = '$msdbLogNew')" -ServerInstance $env:computername
+
+          Stop-Service -Name "mssqlserver" -Force
+
+          Move-Item -Path $msdbDataOld -Destination $msdbDataNew
+          Move-Item -Path $msdbLogOld -Destination $msdbLogNew
+
+          write-output "changed"
+        }
+    register: msdbmove
+    become: yes
+    become_user: vtxadmin
+    changed_when: "'changed' in msdbmove.stdout"
+
+  - name: Pause for a minute for explorer to catch up!
+    pause:
+      minutes: 1
+    when: msdbmove.changed
+
+  - name: Check DB location and restart SQL  
+    win_shell: |
+        if (Test-Path "F:\data\MSDBData.mdf" -PathType Leaf)
+        { 
+          Start-Service -Name "mssqlserver" 
+        }
+        else 
+        {
+          throw 'The file does not exist'
+        }
+    become: yes
+    become_user: vtxadmin
+
+  - name: Move Model
+    win_shell: |
+        if ((Invoke-Sqlcmd -Query "-- check location of model database
+        use model
+        go
+        select count(physical_name)  from sys.database_files
+        where physical_name like 'c:\%'
+        " -ServerInstance $env:computername).column1 -ge 1)
+        {
+          $modelDataOld = 'C:\Program Files\Microsoft SQL Server\MSSQL15.MSSQLSERVER\MSSQL\DATA\model.mdf'
+          $modelDataNew = 'F:\data\model.mdf'
+
+          $modelLogOld = 'C:\Program Files\Microsoft SQL Server\MSSQL15.MSSQLSERVER\MSSQL\DATA\modellog.ldf'
+          $modelLogNew = 'G:\log\modellog.ldf'
+
+          Invoke-Sqlcmd -Query "alter database model
+          modify file (name = 'modeldev', filename = '$modelDataNew')" -ServerInstance $env:computername
+
+          Invoke-Sqlcmd -Query "alter database model
+          modify file (name = 'modellog', filename = '$modelLogNew')" -ServerInstance $env:computername
+
+          Stop-Service -Name "mssqlserver" -Force
+
+          Move-Item -Path $modelDataOld -Destination $modelDataNew
+          Move-Item -Path $modelLogOld -Destination $modelLogNew
+
+          write-output "changed"
+        }
+    register: modelmove
+    become: yes
+    become_user: vtxadmin
+    changed_when: "'changed' in modelmove.stdout"
+
+  - name: Pause for a minute for explorer to catch up!
+    pause:
+      minutes: 1
+    when: modelmove.changed
+
+  - name: Check DB location and restart SQL  
+    win_shell: |
+        if (Test-Path "F:\data\model.mdf" -PathType Leaf)
+        { 
+          Start-Service -Name "mssqlserver" 
+        }
+        else 
+        {
+          throw 'The file does not exist'
+        }
+    become: yes
+    become_user: vtxadmin
+
+  - name: Copy Script
+    copy:
+      src: /repos/ansible/engineering/isa7/scripts/movemaster.ps1
+      dest: C:/media/movemaster.ps1
+  - name: Move Master DB
+    win_shell: |
+        Invoke-Command -scriptblock { C:/media/movemaster.ps1 }
+    become: yes
+    become_user: vtxadmin
+    register: mastermove
+    changed_when: "'changed' in mastermove.stdout"
+
+  - name: Pause for a minute for explorer to catch up!
+    pause:
+      minutes: 1
+    when: mastermove.changed
+
+  - name: Check DB location and restart SQL  
+    win_shell: |
+        if (Test-Path  "F:\data\master.mdf" -PathType Leaf)
+        { 
+          Start-Service -Name "mssqlserver" 
+        }
+        else 
+        {
+          throw 'The file does not exist'
+        }
+    become: yes
+    become_user: vtxadmin
+
+  - name: Start SQL Agent if not started
+    ansible.windows.win_service:
+      name: SQLSERVERAGENT
+      state: started
+
+  - name: Set Data Root
+    win_shell: |
+        Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\MSSQL15.MSSQLSERVER\Setup' -Name SQLDataRoot -Value 'F:\data' -Force 
+    become: yes
+    become_user: vtxadmin
+
+  - name: Enable Filestream
+    win_shell: |
+        if ((Get-WmiObject -Namespace "ROOT\Microsoft\SqlServer\ComputerManagement15" -Class FilestreamSettings | where {$_.InstanceName -eq "MSSQLSERVER"}).accesslevel -eq 0) {
+            $instance = "MSSQLSERVER"
+            $wmi = Get-WmiObject -Namespace "ROOT\Microsoft\SqlServer\ComputerManagement15" -Class FilestreamSettings | where {$_.InstanceName -eq $instance}
+            $wmi.EnableFilestream(3, $instance)
+            Get-Service -Name $instance | Restart-Service -Force
+            Invoke-Sqlcmd "EXEC sp_configure filestream_access_level, 2"
+            Invoke-Sqlcmd "RECONFIGURE"
+            write-output "changed"
+          }
+    become: yes
+    become_user: vtxadmin
+    register: filestream
+    changed_when: "'changed' in filestream.stdout"
+
+- name: Restore DB (Primary)
+  hosts: isa7databaseprimary
+  become_method: runas
+  tasks:
+  - name: Copy DB Backup
+    copy:
+      src: /data/ISADBBlank.bak
+      dest: f:/backup
+
+  - name: Restore DB and add to AG
+    win_shell: |   
+      $env=$env:computername.substring(0,3)
+      $node1=$env+"appsisad1"
+      $node2=$env+"appsisad2"
+      $agname=$env+"appsisaag1"
+
+      Invoke-Sqlcmd -Query "
+      IF NOT EXISTS -- check if ISADB exists
+      (select 1 from sys.databases where name = 'ISADB')
+      BEGIN
+      USE [master]
+      RESTORE DATABASE [ISADB] FROM  DISK = 'F:\Backup\ISADBBlank.bak'
+      WITH  FILE = 1,
+      --MOVE 'ISADB_PRIME_DATFILE' TO N'F:\data\ISADBPrime.mdf',
+      --MOVE 'ISADB_DATFILE' TO N'F:\data\ISADBData.ndf',
+      --MOVE 'ISADB_INDEX_DATFILE' TO N'F:\data\ISADBIndex.ndf',  
+      --MOVE 'ISADB_STAT_DATFILE' TO N'F:\data\ISADBStatData.ndf',  
+      --MOVE 'ISADB_STAT_INDEX_DATFILE' TO N'F:\data\ISADBStatIndex.ndf',  
+      --MOVE 'ISADB_LOGFILE' TO N'G:\log\ISADBLog.ldf',
+      --MOVE 'ISADB_FILESTREAM' TO N'F:\data\ISADBFileStreams',  
+      NOUNLOAD,  STATS = 5
+      END
+      GO" -ServerInstance $env:computername
+      Invoke-Sqlcmd -Query "IF NOT EXISTS (SELECT db.name FROM master.sys.dm_hadr_database_replica_states rs
+      JOIN master.sys.databases db ON rs.database_id = db.database_id
+      where db.name = 'ISADB') -- CHECK IF ISADB IS IN THE AG
+      BEGIN
+      USE [master]
+      ALTER AVAILABILITY GROUP [$agname]
+      MODIFY REPLICA ON N`'$node2`' WITH (SEEDING_MODE = AUTOMATIC)
+      ALTER AVAILABILITY GROUP [$agname]
+      ADD DATABASE [ISADB];
+      END
+      GO" -ServerInstance $env:computername
+    become: yes
+    become_user: vtxadmin
+
+- name: Configure Logins
+  hosts: isa7database
+  become_method: runas
+  tasks:
+  - name: Map User Logins
+    win_shell: |
+      $env=$env:computername.substring(0,3)
+      $Response = Invoke-RestMethod -Uri 'http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fvault.azure.net' -Method GET -Headers @{Metadata="true"}
+      $KeyVaultToken = $Response.access_token
+      $IsaAdminPassword = (Invoke-RestMethod -Uri https://$env-apps-isa-kv.vault.azure.net/secrets/IsaAdminPassword?api-version=2016-10-01 -Method GET -Headers @{Authorization="Bearer $KeyVaultToken"}).value
+      $IsaIdpPassword = (Invoke-RestMethod -Uri https://$env-apps-isa-kv.vault.azure.net/secrets/IsaIdpPassword?api-version=2016-10-01 -Method GET -Headers @{Authorization="Bearer $KeyVaultToken"}).value
+      $IsaQueryPassword = (Invoke-RestMethod -Uri https://$env-apps-isa-kv.vault.azure.net/secrets/IsaQueryPassword?api-version=2016-10-01 -Method GET -Headers @{Authorization="Bearer $KeyVaultToken"}).value
+      $IsaUserPassword = (Invoke-RestMethod -Uri https://$env-apps-isa-kv.vault.azure.net/secrets/IsaUserPassword?api-version=2016-10-01 -Method GET -Headers @{Authorization="Bearer $KeyVaultToken"}).value
+      $cifownerPassword = (Invoke-RestMethod -Uri https://$env-apps-isa-kv.vault.azure.net/secrets/cifownerPassword?api-version=2016-10-01 -Method GET -Headers @{Authorization="Bearer $KeyVaultToken"}).value  
+      
+      Invoke-Sqlcmd -Query "
+      GO
+      IF NOT EXISTS (SELECT loginname FROM master.dbo.syslogins WHERE name = 'IsaAdmin') CREATE LOGIN [IsaAdmin] WITH PASSWORD = `'$IsaAdminPassword`', SID = 0xF5A9E7F76A1C2C4E9BA9AC5E3CDF7B09, DEFAULT_DATABASE = [ISADB], CHECK_POLICY = ON, CHECK_EXPIRATION = OFF, DEFAULT_LANGUAGE = [us_english]
+      GO
+      USE master
+      GO
+      Grant CONNECT SQL TO [IsaAdmin]  AS [sa]
+      GO
+      USE master
+      GO
+      IF NOT EXISTS (SELECT loginname FROM master.dbo.syslogins WHERE name = 'IsaIdp') CREATE LOGIN [IsaIdp] WITH PASSWORD = `'$IsaIdpPassword`', SID = 0xC42732E1667B414DA337C477DCC4FEFE, DEFAULT_DATABASE = [ISADB], CHECK_POLICY = ON, CHECK_EXPIRATION = OFF, DEFAULT_LANGUAGE = [us_english]
+      GO
+      USE master
+      GO
+      Grant CONNECT SQL TO [IsaIdp]  AS [sa]
+      GO
+      USE master
+      GO
+      IF NOT EXISTS (SELECT loginname FROM master.dbo.syslogins WHERE name = 'IsaQuery') CREATE LOGIN [IsaQuery] WITH PASSWORD = `'$IsaQueryPassword`', SID = 0x9E02224B3361E249897A282D2FF5ABD2, DEFAULT_DATABASE = [ISADB], CHECK_POLICY = ON, CHECK_EXPIRATION = OFF, DEFAULT_LANGUAGE = [us_english]
+      GO
+      USE master
+      GO
+      Grant CONNECT SQL TO [IsaQuery]  AS [sa]
+      GO
+      USE master
+      GO
+      IF NOT EXISTS (SELECT loginname FROM master.dbo.syslogins WHERE name = 'IsaUser') CREATE LOGIN [IsaUser] WITH PASSWORD = `'$IsaUserPassword`', SID = 0x902E29FA4FBAE849AEFF8BA6999697B2, DEFAULT_DATABASE = [ISADB], CHECK_POLICY = ON, CHECK_EXPIRATION = OFF, DEFAULT_LANGUAGE = [us_english]
+      GO
+      USE master
+      GO
+      Grant CONNECT SQL TO [IsaUser]  AS [sa]
+      GO
+
+      --run if cif module is installed
+      USE master
+
+      GO
+      IF NOT EXISTS (SELECT loginname FROM master.dbo.syslogins WHERE name = 'cifowner') CREATE LOGIN [cifowner] WITH PASSWORD = `'$cifownerPassword`', SID = 0x396BB2367FA33945A29F41F00B6503CF, DEFAULT_DATABASE = [master], CHECK_POLICY = OFF, CHECK_EXPIRATION = OFF, DEFAULT_LANGUAGE = [us_english]
+      GO
+      
+      USE master
+      
+      GO
+      Grant CONNECT SQL TO [cifowner]  AS [sa]
+      GO" -ServerInstance $env:computername
+    become: yes
+    become_user: vtxadmin
+
+- name: Add ISADB to AG (Secondary)
+  hosts: isa7databasesecondary
+  become_method: runas
+  tasks:
+  - name: Add DB to AG
+    win_shell: |
+      $env=$env:computername.substring(0,3)
+      $node1=$env+"appsisad1"
+      $node2=$env+"appsisad2"
+      $agname=$env+"appsisaag1"
+
+      Invoke-Sqlcmd -Query "
+      USE [master]
+      ALTER AVAILABILITY GROUP [$agname] GRANT CREATE ANY DATABASE;
+      GO" -ServerInstance $env:computername
+    become: yes
+    become_user: vtxadmin
+
+- name: SET ISADB properties
+  hosts: isa7databaseprimary
+  become_method: runas
+  tasks:
+  - name: Map User Logins
+    win_shell: |   
+      Invoke-Sqlcmd -Query "
+      USE [isadb]
+      EXEC sp_change_users_login AUTO_FIX, IsaAdmin
+      EXEC sp_change_users_login AUTO_FIX, IsaUser
+      EXEC sp_change_users_login AUTO_FIX, Isaidp
+      EXEC sp_change_users_login AUTO_FIX, cifowner
+      GO" -ServerInstance $env:computername
+    become: yes
+    become_user: vtxadmin
+
+  - name: ISADB settings
+    win_shell: | 
+      Invoke-Sqlcmd -Query "-- set ISADB file sizes, 1GB size, 1GB growth
+      IF EXISTS -- check the size of the primary data file
+      (select 1 from sys.database_files where name = 'ISADB_PRIME_DATFILE' AND SIZE < 131072)
+      BEGIN
+      USE [master]
+      ALTER DATABASE [ISADB] MODIFY FILE ( NAME = N'ISADB_PRIME_DATFILE', SIZE = 1048576KB , MAXSIZE = UNLIMITED, FILEGROWTH = 1048576KB )
+      ALTER DATABASE [ISADB] MODIFY FILE ( NAME = N'ISADB_DATFILE', SIZE = 1048576KB , MAXSIZE = UNLIMITED, FILEGROWTH = 1048576KB )
+      --ALTER DATABASE [ISADB] MODIFY FILE ( NAME = N'ISADB_FILESTREAM', SIZE = 1048576KB , MAXSIZE = UNLIMITED, FILEGROWTH = 1048576KB )
+      --GO
+      ALTER DATABASE [ISADB] MODIFY FILE ( NAME = N'ISADB_INDEX_DATFILE', SIZE = 1048576KB , MAXSIZE = UNLIMITED, FILEGROWTH = 1048576KB )
+      ALTER DATABASE [ISADB] MODIFY FILE ( NAME = N'ISADB_STAT_DATFILE', SIZE = 1048576KB , MAXSIZE = UNLIMITED, FILEGROWTH = 1048576KB )
+      ALTER DATABASE [ISADB] MODIFY FILE ( NAME = N'ISADB_STAT_INDEX_DATFILE', SIZE = 1048576KB , MAXSIZE = UNLIMITED, FILEGROWTH = 1048576KB )
+      ALTER DATABASE [ISADB] MODIFY FILE ( NAME = N'ISADB_LOGFILE', SIZE = 1048576KB , MAXSIZE = 2048GB, FILEGROWTH = 1048576KB )
+      END
+      GO" -ServerInstance $env:computername
+      Invoke-Sqlcmd -Query "-- Enable QueryStore
+      ALTER DATABASE [ISADB]
+      SET QUERY_STORE = ON
+      (
+      OPERATION_MODE = READ_WRITE,
+      CLEANUP_POLICY = ( STALE_QUERY_THRESHOLD_DAYS = 90 ),
+      DATA_FLUSH_INTERVAL_SECONDS = 900,
+      QUERY_CAPTURE_MODE = AUTO,
+      MAX_STORAGE_SIZE_MB = 1000,
+      INTERVAL_LENGTH_MINUTES = 60
+      );
+      GO" -ServerInstance $env:computername
+    become: yes
+    become_user: vtxadmin
+
+  - name: Remove database
+    win_shell: |
+      $env=$env:computername.substring(0,3)
+      $node1=$env+"appsisad1"
+      $node2=$env+"appsisad2"
+      $agname=$env+"appsisaag1"
+
+      Invoke-Sqlcmd -Query "IF EXISTS (SELECT db.name FROM master.sys.dm_hadr_database_replica_states rs
+      JOIN master.sys.databases db ON rs.database_id = db.database_id
+      where db.name = 'ag01') -- CHECK IF AG01 IS IN THE AG
+      BEGIN
+      USE [master]
+      ALTER AVAILABILITY GROUP [$agname]
+      REMOVE DATABASE [ag01];
+      END
+      GO" -ServerInstance $env:computername
+      Invoke-Sqlcmd -Query "IF EXISTS (SELECT name FROM master.dbo.sysdatabases WHERE name = N'ag01')
+      DROP DATABASE ag01" -ServerInstance $env:computername
+    become: yes
+    become_user: vtxadmin
+
+  - name: Add DB Access Permissions using AAD Groups (Primary)
+    win_shell: |
+      $env=$env:computername.substring(0,3)
+      $domain=$env+"ad" 
+      Invoke-Sqlcmd -Query "
+      USE master
+      IF NOT EXISTS (SELECT loginname FROM master.dbo.syslogins WHERE name = '$domain\SQL Read Only ISA')
+      CREATE LOGIN [$domain\SQL Read Only ISA] FROM WINDOWS WITH DEFAULT_DATABASE=[master], DEFAULT_LANGUAGE=[us_english]
+      IF NOT EXISTS (SELECT loginname FROM master.dbo.syslogins WHERE name = '$domain\SQL Read Write ISA')
+      CREATE LOGIN [$domain\SQL Read Write ISA] FROM WINDOWS WITH DEFAULT_DATABASE=[master], DEFAULT_LANGUAGE=[us_english]
+      IF NOT EXISTS (SELECT loginname FROM master.dbo.syslogins WHERE name = '$domain\SQL Extended Read ISA')
+      CREATE LOGIN [$domain\SQL Extended Read ISA] FROM WINDOWS WITH DEFAULT_DATABASE=[master], DEFAULT_LANGUAGE=[us_english]
+      IF NOT EXISTS (SELECT loginname FROM master.dbo.syslogins WHERE name = '$domain\SQL Support ISA')
+      CREATE LOGIN [$domain\SQL Support ISA] FROM WINDOWS WITH DEFAULT_DATABASE=[master], DEFAULT_LANGUAGE=[us_english]
+      IF NOT EXISTS (SELECT loginname FROM master.dbo.syslogins WHERE name = '$domain\SQL Admin ISA')
+      CREATE LOGIN [$domain\SQL Admin ISA] FROM WINDOWS WITH DEFAULT_DATABASE=[master], DEFAULT_LANGUAGE=[us_english]
+      USE ISADB
+      IF NOT EXISTS (SELECT [name] FROM [sys].[database_principals]
+      WHERE [name] = N'$domain\SQL Read Only ISA')
+      BEGIN
+      CREATE USER [$domain\SQL Read Only ISA]
+      FOR LOGIN [$domain\SQL Read Only ISA] WITH DEFAULT_SCHEMA=[dbo]
+      ALTER ROLE [db_datareader] ADD MEMBER [$domain\SQL Read Only ISA]
+      END
+      IF NOT EXISTS (SELECT [name] FROM [sys].[database_principals]
+      WHERE [name] = N'$domain\SQL Extended Read ISA')
+      BEGIN
+      CREATE USER [$domain\SQL Extended Read ISA]
+      FOR LOGIN [$domain\SQL Extended Read ISA] WITH DEFAULT_SCHEMA=[dbo]
+      ALTER ROLE [db_datareader] ADD MEMBER [$domain\SQL Extended Read ISA]
+      GRANT View DEFINITION to  [$domain\SQL Extended Read ISA] -- View DDL procs, functions, triggers
+      GRANT showplan to  [$domain\SQL Extended Read ISA] -- View execution plans
+      END
+      IF NOT EXISTS (SELECT [name] FROM [sys].[database_principals]
+      WHERE [name] = N'$domain\SQL Read Write ISA')
+      BEGIN
+      CREATE USER [$domain\SQL Read Write ISA]
+      FOR LOGIN [$domain\SQL Read Write ISA] WITH DEFAULT_SCHEMA=[dbo]
+      ALTER ROLE [db_datareader] ADD MEMBER [$domain\SQL Read Write ISA]
+      ALTER ROLE [db_datawriter] ADD MEMBER [$domain\SQL Read Write ISA]
+      END
+      IF NOT EXISTS (SELECT [name] FROM [sys].[database_principals]
+      WHERE [name] = N'$domain\SQL Support ISA')
+      BEGIN
+      CREATE USER [$domain\SQL Support ISA]
+      FOR LOGIN [$domain\SQL Support ISA] WITH DEFAULT_SCHEMA=[dbo]
+      ALTER ROLE [db_datareader] ADD MEMBER [$domain\SQL Support ISA]
+      ALTER ROLE [db_datawriter] ADD MEMBER [$domain\SQL Support ISA]
+      ALTER ROLE [db_ddladmin] ADD MEMBER [$domain\SQL Support ISA] --DML access DDL Admin
+      GRANT EXEC To [$domain\SQL Support ISA] -- Stored Proc and Function Execute
+      GRANT View DEFINITION to [$domain\SQL Support ISA] -- View DDL procs, functions, triggers
+      GRANT showplan to  [$domain\SQL Support ISA] -- View execution plans
+      END  
+      IF NOT EXISTS (SELECT [name] FROM [sys].[database_principals]
+      WHERE [name] = N'$domain\SQL Admin ISA')
+      BEGIN
+      CREATE USER [$domain\SQL Admin ISA]
+      FOR LOGIN [$domain\SQL Admin ISA] WITH DEFAULT_SCHEMA=[dbo]
+      ALTER SERVER ROLE [sysadmin] ADD MEMBER [$domain\SQL Admin ISA]
+      END
+      USE master
+      -- AG view state
+      Declare @AGName varchar (30)
+      Declare @SQL varchar (200)
+      select @AGName = (SELECT Groups.[Name]     FROM sys.dm_hadr_availability_group_states States
+      INNER JOIN master.sys.availability_groups Groups ON States.group_id = Groups.group_id)
+      select @SQL = 'GRANT VIEW DEFINITION ON AVAILABILITY GROUP:: [' + @AGName + '] TO [$domain\SQL Extended Read ISA]'
+      EXEC (@SQL)
+      -- AG view state
+      Declare @AGName2 varchar (30)
+      Declare @SQL2 varchar (200)
+      select @AGName2 = (SELECT Groups.[Name]     FROM sys.dm_hadr_availability_group_states States
+      INNER JOIN master.sys.availability_groups Groups ON States.group_id = Groups.group_id)
+      select @SQL2 = 'GRANT VIEW DEFINITION ON AVAILABILITY GROUP:: [' + @AGName2 + '] TO [$domain\SQL Support ISA]'
+      EXEC (@SQL2)
+      " -ServerInstance $env:computername
+    become: yes
+    become_user: vtxadmin
+
+- name: Remove database AG01 (Secondary)
+  hosts: isa7databasesecondary
+  become_method: runas
+  tasks:
+  - name: Remove database
+    win_shell: |   
+      Invoke-Sqlcmd -Query "IF EXISTS (SELECT name FROM master.dbo.sysdatabases WHERE name = N'ag01')
+      DROP DATABASE ag01" -ServerInstance $env:computername
+    become: yes
+    become_user: vtxadmin
+
+  - name: Add DB Access Permissions using AAD Groups (Secondary)
+    win_shell: |   
+      $env=$env:computername.substring(0,3)
+      $domain=$env+"ad"
+      Invoke-Sqlcmd -Query "
+      USE master
+      IF NOT EXISTS (SELECT loginname FROM master.dbo.syslogins WHERE name = '$domain\SQL Read Only ISA')
+      CREATE LOGIN [$domain\SQL Read Only ISA] FROM WINDOWS WITH DEFAULT_DATABASE=[master], DEFAULT_LANGUAGE=[us_english]
+      IF NOT EXISTS (SELECT loginname FROM master.dbo.syslogins WHERE name = '$domain\SQL Read Write ISA')
+      CREATE LOGIN [$domain\SQL Read Write ISA] FROM WINDOWS WITH DEFAULT_DATABASE=[master], DEFAULT_LANGUAGE=[us_english]
+      IF NOT EXISTS (SELECT loginname FROM master.dbo.syslogins WHERE name = '$domain\SQL Extended Read ISA')
+      CREATE LOGIN [$domain\SQL Extended Read ISA] FROM WINDOWS WITH DEFAULT_DATABASE=[master], DEFAULT_LANGUAGE=[us_english]
+      IF NOT EXISTS (SELECT loginname FROM master.dbo.syslogins WHERE name = '$domain\SQL Support ISA')
+      CREATE LOGIN [$domain\SQL Support ISA] FROM WINDOWS WITH DEFAULT_DATABASE=[master], DEFAULT_LANGUAGE=[us_english]
+      IF NOT EXISTS (SELECT loginname FROM master.dbo.syslogins WHERE name = '$domain\SQL Admin ISA')
+      CREATE LOGIN [$domain\SQL Admin ISA] FROM WINDOWS WITH DEFAULT_DATABASE=[master], DEFAULT_LANGUAGE=[us_english]
+      ALTER SERVER ROLE [sysadmin] ADD MEMBER [$domain\SQL Admin ISA]
+      -- AG view state
+      Declare @AGName varchar (30)
+      Declare @SQL varchar (200)
+      select @AGName = (SELECT Groups.[Name]     FROM sys.dm_hadr_availability_group_states States
+      INNER JOIN master.sys.availability_groups Groups ON States.group_id = Groups.group_id)
+      select @SQL = 'GRANT VIEW DEFINITION ON AVAILABILITY GROUP:: [' + @AGName + '] TO [$domain\SQL Extended Read ISA]'
+      EXEC (@SQL)
+      -- AG view state
+      Declare @AGName2 varchar (30)
+      Declare @SQL2 varchar (200)
+      select @AGName2 = (SELECT Groups.[Name]     FROM sys.dm_hadr_availability_group_states States
+      INNER JOIN master.sys.availability_groups Groups ON States.group_id = Groups.group_id)
+      select @SQL2 = 'GRANT VIEW DEFINITION ON AVAILABILITY GROUP:: [' + @AGName2 + '] TO [$domain\SQL Support ISA]'
+      EXEC (@SQL2)
+      " -ServerInstance $env:computername
+    become: yes
+    become_user: vtxadmin

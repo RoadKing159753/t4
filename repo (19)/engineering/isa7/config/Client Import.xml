@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<InterfaceData>
+<Name>Client Import.xml</Name>
+<ArchiveDays>7</ArchiveDays>
+<ArchiveLocation>\\storage.file.core.windows.net\cifdata\ClientImport\Archive</ArchiveLocation>
+<ImportLocation>\\storage.file.core.windows.net\cifdata\ClientImport\Import</ImportLocation>
+<ProcessingLocation>\\storage.file.core.windows.net\cifdata\ClientImport\Processing</ProcessingLocation>
+<RejectLocation>\\storage.file.core.windows.net\cifdata\ClientImport\Reject</RejectLocation>
+<ErrorLocation>\\storage.file.core.windows.net\cifdata\ClientImport\Error</ErrorLocation>
+<MaxFileRead>10</MaxFileRead>
+<UserName>INSTALL</UserName>
+<Password>26grns+GT2gV23f26AJJ9w==</Password>
+<CashCentre>999</CashCentre>
+<ApiKeyClient></ApiKeyClient>
+<ApiKeyXTClient></ApiKeyXTClient>
+</InterfaceData>

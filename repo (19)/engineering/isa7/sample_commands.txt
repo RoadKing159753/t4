@@ -1,0 +1,3 @@
+# Build the Test Database hosts using the get_keyvaultsecret.sh script to pass in the become password from the management keyvault
+
+ansible-playbook -i isa7hosts_tst isa7database.yml -l isa7database -e "ansible_become_password=`./get_keyaultsecret.sh vtxadmin`"

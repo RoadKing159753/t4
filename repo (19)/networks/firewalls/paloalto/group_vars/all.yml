@@ -1,0 +1,16 @@
+# Shared settings for all Palo Alto firewalls
+ansible_python_interpreter: '{{ ansible_playbook_python }} '
+login_banner: 'Property of Vaultex UK'
+username: 'svc_ansible'
+domain: 'vaultexuk.net'
+timezone: 'Europe/London'
+
+# Encrypted Password using Ansible Vault
+# To be recreated when in prod
+password: !vault |
+          $ANSIBLE_VAULT;1.1;AES256
+          30303130303631373664383434653335346265653232333666613638326534653432666130333437
+          6665623138373332633137363532323431396564313837610a393966653837373338336139333336
+          37343862363364386334643562356332306664383363303065353934303664346237363738333863
+          3366396636396432640a393930393432333562646162636363636162346232356262386136376366
+          3664

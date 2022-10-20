@@ -1,0 +1,4 @@
+load('ConfigureReplicaSet.js')
+rs.add( { host: 'envappsisas2', priority: 10 } )
+rs.addArb('envappsisas3')
+rs.status()

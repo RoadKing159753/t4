@@ -1,0 +1,113 @@
+---
+- name: ISA7 Post Bulid Script
+  hosts: isa7
+  tasks:
+  - name: Disble NLA Set Reg Key 1
+    ansible.windows.win_regedit:
+      path: HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp
+      name: SecurityLayer
+      data: 0
+      type: dword
+
+  - name: Disable NLA Set Reg Key 2
+    ansible.windows.win_regedit:
+      path: HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp
+      name: UserAuthentication
+      data: 0
+      type: dword
+
+  - name: Set Domain Suffix
+    ansible.windows.win_regedit:
+      path: HKLM:\SYSTEM\CurrentControlSet\services\Tcpip\Parameters
+      name: 'NV Domain'
+      data: 'mgt.prvdns.vaultexuk.net'
+      type: string
+
+  - name: Set TimeZone to GMT
+    ansible.windows.win_powershell:
+      script: |
+         if ((get-timezone).id -eq 'GMT Standard Time') {
+             $Ansible.Changed = $false
+         }
+         else {
+             set-timezone 'GMT Standard Time'
+             $Ansible.Changed = $true
+         }
+
+  - name: Move CD Rom to Z
+    ansible.windows.win_powershell:
+      script: |
+        $DVD_Drive = Get-WmiObject win32_volume -filter 'DriveType = "5"'
+        if (($DVD_drive.DriveLetter -eq 'Z:') -or ($DVD_drive.count -eq 0)) {
+           $Ansible.Changed = $false
+        }
+        else {
+            $DVD_Drive.DriveLetter = "Z:"
+            $DVD_Drive.Put()
+
+            $Ansible.Changed = $true
+        }
+
+  - name: Pause for a minute for explorer to catch up!
+    pause:
+      minutes: 1
+
+  - name: Configure Data Drive
+    ansible.windows.win_powershell:
+      script: |
+        if (test-path 'd:\') {
+           $Ansible.Changed = $false
+        }
+        else {
+           Initialize-Disk -Number 1
+           New-Partition -DiskNumber 1 -UseMaximumSize -DriveLetter D
+           Format-Volume -DriveLetter D -FileSystem NTFS -NewFileSystemLabel Data -AllocationUnitSize 65536 -Confirm:$false
+           $Ansible.Changed = $true
+        }
+
+- name: ISA7 Web Config
+  hosts: isa7web
+  tasks:
+  - name: Install IIS Web-Server and management tools
+    ansible.windows.win_feature:
+      name: Web-Server
+      state: present
+      include_sub_features: no
+      include_management_tools: yes
+
+  - name: Install ASP.Net
+    ansible.windows.win_feature:
+      name: Web-Asp-Net
+      state: present
+
+  - name: Install ASP.Net 45
+    ansible.windows.win_feature:
+      name: Web-Asp-Net45
+      state: present
+
+  - name: Install IIS Basic Auth Support
+    ansible.windows.win_feature:
+      name: Web-Basic-Auth
+      state: present
+
+
+  - name: Install IIS Windows Auth Support
+    ansible.windows.win_feature:
+      name: Web-Windows-Auth
+      state: present
+
+  - name: Copy Script
+    copy:
+      src: /repos/ansible/engineering/isa7/scripts/moveiisroot.bat
+      dest: C:/windows/temp/moveiisroot.bat
+
+  - name: Move IIS Root to D
+    ansible.windows.win_powershell:
+      script: |
+        if (test-path 'd:/inetpub/') {
+           $Ansible.Changed = $false
+        }
+        else {
+           $Ansible.Changed = $true
+           Start-Process -wait 'cmd.exe'  '/c C:/windows/temp/moveiisroot.bat d >>c:/windows/temp/output.txt'
+        }
